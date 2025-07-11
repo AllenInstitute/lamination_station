@@ -1,0 +1,99 @@
+name: Python Package Make
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Working directory in which to run this workflow." 
+        required: false
+        type: string
+        default: "./"
+      make_target: 
+        description: "Make Target to run"
+        required: false
+        type: string
+        default: "release"
+      timeout_minutes: 
+        description: "timeout for package"
+        required: false
+        type: number
+        default: 5
+      python_version_matrix:
+        description: "stringified json list of python version targets"
+        required: false
+        type: string
+        default: '["3.9", "3.10", "3.11"]'
+      enable_codecov:
+        description: "Enable codecov upload"
+        required: false
+        type: boolean
+        default: false
+      codecov_python_version:
+        description: "Default python version"
+        required: false
+        type: string
+        default: "3.9"
+      codecov_base_ref:
+        description: "Base ref for codecov upload"
+        required: false
+        type: string
+        default: "main"
+      codecov_flags:
+        description: "Flag to use for codecov upload"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      ai-packages-token:
+        required: false
+      ai-packages-ssh-private-key:
+        required: false
+      codecov-token:
+        required: false
+
+jobs:
+
+  make:
+    name: make ${{ inputs.make_target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python_version_matrix) }}
+    env:
+      PYTHON_VERSION: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      - name: Set up AllenInstitute Repo Authorization
+        uses: ./.github/actions/setup-ai-github-urls
+        with:
+          token: ${{ secrets.ai-packages-token }}
+          ssh_private_key: ${{ secrets.ai-packages-ssh-private-key }}
+      - name: Run Release
+        run: |
+          cd ${{ inputs.working_directory }}
+          make ${{ inputs.make_target }}
+        shell: bash
+      - name: Upload coverage reports
+        if: |
+          ${{ 
+            success()
+            && inputs.enable_codecov
+            && (
+              (github.event_name == 'pull_request' && github.base_ref == inputs.codecov_base_ref ) || 
+              (github.event_name == 'push' && github.ref_name == inputs.codecov_base_ref )
+            )
+            && matrix.python-version == inputs.codecov_python_version
+          }}
+        uses: codecov/codecov-action@v3
+        with:
+          # https://github.com/codecov/codecov-action#arguments
+          token: ${{ secrets.codecov-token }}
+          env_vars: PYTHON_VERSION
+          flags: ${{ inputs.codecov_flags }}

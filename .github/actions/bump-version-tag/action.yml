@@ -1,0 +1,117 @@
+name: Bump Version and Tag Reusable Workflow
+
+description: |
+  Get the would-be bumped version and version tag for a commit based on the 
+  changes since last version.
+inputs:
+  bump_type:
+    description: 'Version Bump Type'
+    type: choice
+    options: ['major', 'minor', 'patch', 'none']
+    required: false
+    default: 'none'
+  dry_run:
+    description: 'Dry Run'
+    type: boolean
+    required: false
+    default: false
+  token:
+    description: 'Token for AllenInstitute GitHub'
+    required: true
+outputs:
+  major:
+    description: 'The major version number'
+    value: ${{ steps.set-outputs.outputs.major }}
+  minor:
+    description: 'The minor version number'
+    value: ${{ steps.set-outputs.outputs.minor }}
+  patch:
+    description: 'The patch version number'
+    value: ${{ steps.set-outputs.outputs.patch }}
+  increment:
+    description: 'The increment. This is the number of commits since the last tag.'
+    value: ${{ steps.set-outputs.outputs.increment }}
+  version:
+    description: 'The version number (e.g. 1.2.3)'
+    value: ${{ steps.set-outputs.outputs.version }}
+  version_tag:
+    description: 'The version tag (e.g. v1.2.3)'
+    value: ${{ steps.set-outputs.outputs.version_tag }}
+  version_type:
+    description: 'The version type (e.g. major, minor, patch, none)'
+    value: ${{ steps.set-outputs.outputs.version_type }}
+  previous_version:
+    description: 'The previous version number (e.g. 1.2.2)'
+    value: ${{ steps.set-outputs.outputs.previous_version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Bump patch version and tag
+      id: bump-version-tag
+      uses: anothrNick/github-tag-action@1.64.0
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        DEFAULT_BUMP: ${{ inputs.bump_type || 'none' }}
+        MAJOR_STRING_TOKEN: '(MAJOR)'
+        MINOR_STRING_TOKEN: '(MINOR)'
+        PATCH_STRING_TOKEN: '(PATCH)'
+        NONE_STRING_TOKEN: '(NONE)'
+        WITH_V: "true"
+        RELEASE_BRANCHES: main
+        DRY_RUN: true
+    - name: Set Outputs
+      id: set-outputs
+      run: |
+        new_tag=${{ steps.bump-version-tag.outputs.new_tag }}
+        new_version=$(echo $new_tag | sed 's/^v//')
+        major=$(echo $new_version | cut -d. -f1)
+        minor=$(echo $new_version | cut -d. -f2)
+        patch=$(echo $new_version | cut -d. -f3)
+        increment=0
+        version_type=${{ steps.bump-version-tag.outputs.part }}
+        previous_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+
+        echo "major=$major" >> $GITHUB_OUTPUT
+        echo "minor=$minor" >> $GITHUB_OUTPUT
+        echo "patch=$patch" >> $GITHUB_OUTPUT
+        echo "increment=$increment" >> $GITHUB_OUTPUT
+        echo "version=$new_version" >> $GITHUB_OUTPUT
+        echo "version_tag=$new_tag" >> $GITHUB_OUTPUT
+        echo "version_type=$version_type" >> $GITHUB_OUTPUT
+        echo "previous_version=$previous_version" >> $GITHUB_OUTPUT
+      shell: bash
+
+    # Currently not using this Version bumping tool, but considering it for the future.
+    # The main limitation is being able to override the default bump type even 
+    # if there are no commits.
+    - name: Bump Version Alternate
+      uses: PaulHatch/semantic-version@v5.4.0
+      id: bump-version-tag-alt
+      with:
+        major_pattern: "/\\((MAJOR|BREAKING)\\)/"
+        minor_pattern: "/\\((MINOR|FEATURE)\\)/"
+        bump_each_commit: true
+        bump_each_commit_patch_pattern: "/\\((PATCH|BUG)\\)/"
+    - name: Set Outputs Alt
+      id: set-outputs-alt
+      shell: bash
+      run: |
+        echo 'changed:          ${{ steps.bump-version-tag-alt.outputs.changed }}'
+        echo 'major:            ${{ steps.bump-version-tag-alt.outputs.major }}'
+        echo 'minor:            ${{ steps.bump-version-tag-alt.outputs.minor }}'
+        echo 'patch:            ${{ steps.bump-version-tag-alt.outputs.patch }}'
+        echo 'increment:        ${{ steps.bump-version-tag-alt.outputs.increment }}'
+        echo 'version:          ${{ steps.bump-version-tag-alt.outputs.version }}'
+        echo 'version_tag:      ${{ steps.bump-version-tag-alt.outputs.version_tag }}'
+        echo 'version_type:     ${{ steps.bump-version-tag-alt.outputs.version_type }}'
+        echo 'previous_version: ${{ steps.bump-version-tag-alt.outputs.previous_version }}'
+
+        # echo "major=${{ steps.bump-version-tag-alt.outputs.major }}" >> $GITHUB_OUTPUT
+        # echo "minor=${{ steps.bump-version-tag-alt.outputs.minor }}" >> $GITHUB_OUTPUT
+        # echo "patch=${{ steps.bump-version-tag-alt.outputs.patch }}" >> $GITHUB_OUTPUT
+        # echo "increment=${{ steps.bump-version-tag-alt.outputs.increment }}" >> $GITHUB_OUTPUT
+        # echo "version=${{ steps.bump-version-tag-alt.outputs.version }}" >> $GITHUB_OUTPUT
+        # echo "version_tag=${{ steps.bump-version-tag-alt.outputs.version_tag }}" >> $GITHUB_OUTPUT
+        # echo "version_type=${{ steps.bump-version-tag-alt.outputs.version_type }}" >> $GITHUB_OUTPUT
+        # echo "previous_version=${{ steps.bump-version-tag-alt.outputs.previous_version }}" >> $GITHUB_OUTPUT
