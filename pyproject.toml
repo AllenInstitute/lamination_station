@@ -8,15 +8,45 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = ""
-description = ""
+name = "lamination_station"
+description = "A small Bayesian model to take a bunch of x,y points with cell type labels and attempt to identify discrete structures or laminae within."
 version = "0.0.1"
-requires-python = ">=3.9"
-dependencies = []
+requires-python = ">=3.12"
+
+dependencies = [
+  "anndata",
+  "scanpy",
+  "seaborn",
+  "pandas",
+  "matplotlib",
+  "numpy",
+  "tqdm",
+  "torch",
+  "pyro-ppl",
+  "networkx",
+]
 
 [project.optional-dependencies]
-dev = []
+dev = [
+  "pytest",
+  "pytest-cov",
+  "mypy",
+  "black",
+  "isort",
+]
 
+rapids = [
+  "cudf-cu12==25.6.*",
+  "dask-cudf-cu12==25.6.*",
+  "cuml-cu12==25.6.*",
+  "cugraph-cu12==25.6.*",
+  "nx-cugraph-cu12==25.6.*",
+  "cuxfilter-cu12==25.6.*",
+  "cucim-cu12==25.6.*",
+  "pylibraft-cu12==25.6.*",
+  "raft-dask-cu12==25.6.*",
+  "cuvs-cu12==25.6.*",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
