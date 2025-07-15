@@ -234,8 +234,10 @@ def run_model(
                     out_dist = dist.NegativeBinomial(total_count=theta,logits=rate - torch.logsumexp(rate,-1,keepdim=True) + counts_b.sum(-1).unsqueeze(-1).log() - theta.log()).to_event(1)
                 elif OBS_FAMILY=='poisson':
                     out_dist = dist.Poisson(rate=F.softmax(rate, dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
-                else:
+                elif OBS_FAMILY=='multinomial':
                     out_dist = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=rate)
+                else:
+                    raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
                 pyro.sample("obs",
                             out_dist,
                             obs=counts_b)
@@ -256,8 +258,10 @@ def run_model(
                     out_dist2 = dist.NegativeBinomial(total_count=theta,logits=comp_logits - torch.logsumexp(comp_logits,-1,keepdim=True) + counts_b.sum(-1).unsqueeze(-1).log() - theta.log()).to_event(1)
                 elif OBS_FAMILY=='poisson':
                     out_dist2 = dist.Poisson(rate=F.softmax(comp_logits,dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
+                elif OBS_FAMILY=='multinomial':
+                    out_dist2 = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=comp_logits
                 else:
-                    out_dist2 = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=comp_logits)
+                    raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
                 pyro.sample("obs_2",
                             out_dist2,
                             obs=counts_b)
