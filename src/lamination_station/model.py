@@ -154,7 +154,7 @@ def run_model(
         grads.unsqueeze(1),
         type_vecs,
         dim=-1
-    ).abs().to(device)
+    ).to(device)
     
     
     # one-hot cell identity
@@ -210,7 +210,7 @@ def run_model(
     def unified_model(id_b, grad_b, vecs_b, counts_b, cos_b):
         '''gpgmm style NB'''
         with pyro.poutine.scale(scale=LOSS_SCALE):
-            comp_b = counts_b / counts_b.sum(-1,keepdims=True)
+            comp_b = (counts_b / counts_b.sum(-1,keepdims=True)).detach()
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
         
@@ -245,7 +245,7 @@ def run_model(
                 elif OBS_FAMILY=='poisson':
                     out_dist = dist.Poisson(rate=F.softmax(rate, dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
                 elif OBS_FAMILY=='multinomial':
-                    out_dist = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=rate)
+                    out_dist = dist.Multinomial(total_count=int(counts_b.sum(-1).max().squeeze()), logits=rate)
                 else:
                     raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
                 pyro.sample("obs",
@@ -269,7 +269,7 @@ def run_model(
                 elif OBS_FAMILY=='poisson':
                     out_dist2 = dist.Poisson(rate=F.softmax(comp_logits,dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
                 elif OBS_FAMILY=='multinomial':
-                    out_dist2 = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=comp_logits)
+                    out_dist2 = dist.Multinomial(total_count=int(counts_b.sum(-1).max().squeeze()), logits=comp_logits)
                 else:
                     raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
                 pyro.sample("obs_2",

@@ -130,7 +130,7 @@ def plot_cells_on_structure_graph(out,
         palette='tab20',
         legend='full'
     )
-
+    plt.legend(bbox_to_anchor=(1.05,1), loc="upper left")
     ax.set_axis_off()
     plt.tight_layout()
     plt.show()
@@ -147,7 +147,7 @@ def plot_loss(loss_tracker):
 def moving_average(x, w):
     return np.convolve(x, np.ones(w), 'valid') / w
 
-def plot_gradient_arrows(df_grads,gradients,taxon,x_col,y_col,xlim,ylim):
+def plot_gradient_arrows(df_grads,gradients,taxon,x_col,y_col,xlim=None,ylim=None,scale=2.):
     mask = np.array([True for x in df_grads.index])
     x = df_grads.loc[mask, x_col]
     y = df_grads.loc[mask, y_col]
@@ -158,7 +158,7 @@ def plot_gradient_arrows(df_grads,gradients,taxon,x_col,y_col,xlim,ylim):
     
     # 4) build your color mapping off of df_grads
     unique_types = df_grads.loc[mask, taxon].unique()
-    cmap = list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102)
+    cmap = list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102)
     color_map = {ctype: cmap[i] for i, ctype in enumerate(unique_types)}
     colors = df_grads.loc[mask, taxon].map(color_map)
     
@@ -179,10 +179,11 @@ def plot_gradient_arrows(df_grads,gradients,taxon,x_col,y_col,xlim,ylim):
                alpha=alphas,
                angles='xy',
                scale_units='xy',
-               scale=2.)
-    
-    plt.xlim(xlim)
-    plt.ylim(ylim)
+               scale=scale)
+    if xlim is not None:
+        plt.xlim(xlim)
+    if xlim is not None:
+        plt.ylim(ylim)
     plt.xlabel(x_col)
     plt.ylabel(y_col)
 
