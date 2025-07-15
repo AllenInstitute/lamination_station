@@ -7,7 +7,8 @@ def calculate_comp_grads(
     x_col: str,
     y_col: str,
     celltype_col: str,
-    k: int = 5,
+    near_k: int = 25,
+    far_k: int = 100
     eps: float = 1e-2,
     n_bins: int = 36,
     absgrad: bool = True,

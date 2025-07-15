@@ -52,7 +52,9 @@ class Decoder(PyroModule):
 def run_model(
     df_grads, #output from calculate_comp_grads
     cell_types_series, #pandas categorical series
+    neighbor_counts,
     gradients, #output from calculate_comp_grads
+    neighbor_type_vecs,
     LATENT_DIM     = 2,
     NUM_STRUCTURES = 25,
     num_epochs=2000,
@@ -65,7 +67,8 @@ def run_model(
     HIDDEN_DIM = 512,
     HIDDEN_DIM_CLASSIFIER = 128,
     device = 'cpu',
-    clear_params = True
+    clear_params = True,
+    normalize_sampling = True
 ):
     """
     Train a Pyro-based variational model to infer latent spatial structures
@@ -83,6 +86,10 @@ def run_model(
         `df_grads`.
     gradients : array-like, shape (N, D)
         Gradient vectors per cell (also returned by `calculate_comp_grads`).
+    neighbor_counts : array-like, shape (N, T)
+        Composition of neighbors per cell (also returned by `calculate_comp_grads`).
+    neighbor_type_vecs : array-like, shape (N, T, 2)
+        Mean vector from each cell to neighbor types (also returned by `calculate_comp_grads`).
     LATENT_DIM : int, default=2
         Dimensionality of the latent embedding space (z).
     NUM_STRUCTURES : int, default=25
@@ -109,6 +116,8 @@ def run_model(
         Compute device for tensors and model parameters.
     clear_params : bool, default=True
         Whether to clear the Pyro parameter store before fitting.
+    normalize_sampling : bool, default=True
+        Whether to sample each cell type equally or in the existing proportion.
 
     Returns
     -------
@@ -130,12 +139,13 @@ def run_model(
     # comp_vectors, gradients, neighbor_type_vecs (DataFrame),
     # neighbor_counts (DataFrame), and df already in scope.
     
-    comp = torch.tensor(comp_vectors, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
+    counts = torch.tensor(neighbor_counts.values, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
+    comp = counts / counts.sum(-1,keepdims=True)
     grads = torch.tensor(gradients, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
     
     # reshape neighbor_type_vecs → (N, T, 2)
     N, twoT = neighbor_type_vecs.shape
-    T       = comp.shape[1]
+    T       = counts.shape[1]
     vecs_np = neighbor_type_vecs.values.reshape(N, T, 2)
     type_vecs = torch.tensor(vecs_np, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
     
@@ -146,7 +156,6 @@ def run_model(
         dim=-1
     ).abs().to(device)
     
-    counts = torch.tensor(neighbor_counts.values, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
     
     # one-hot cell identity
     cell_types   = cell_types_series.values
@@ -159,13 +168,13 @@ def run_model(
     id_b = torch.tensor(id_arr, dtype=torch.float, device=device,requires_grad=False)
     
     # ──────────────── DataLoader ────────────────
-    # dataset = TensorDataset(comp, id_b, grads, type_vecs, counts, grad_type_cos)
+    # dataset = TensorDataset(id_b, grads, type_vecs, counts, grad_type_cos)
     # loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
     
     labels       = np.array([type_to_ix[t] for t in cell_types])  # shape (N,)
     class_counts = np.bincount(labels)+200                  #Add 200 so super rare don't get way oversampled
     # weight for sample i = 1 / count_of_class(labels[i])
-    sample_weights = 1.0 / class_counts[labels]           
+    sample_weights = 1.0 / class_counts[labels] if normalize_sampling else  class_counts[labels]/class_counts[labels]
     sample_weights = torch.from_numpy(sample_weights).double().to(device)
     
     # 3) make a WeightedRandomSampler
@@ -176,12 +185,12 @@ def run_model(
     )
     
     # 4) DataLoader with sampler instead of shuffle
-    dataset = TensorDataset(comp, id_b, grads, type_vecs, counts, grad_type_cos)
+    dataset = TensorDataset(id_b, grads, type_vecs, counts, grad_type_cos)
     loader  = DataLoader(
         dataset,
         batch_size=batch_size,
-        sampler=sampler,    # <-- drop shuffle=True
-        drop_last=False
+        sampler=sampler,
+        drop_last=True
     )
     
     
@@ -198,9 +207,10 @@ def run_model(
     pyro.module("classifier", classifier)
     pyro.module("decoder",    decoder)
     
-    def unified_model(comp_b, id_b, grad_b, vecs_b, counts_b, cos_b):
+    def unified_model(id_b, grad_b, vecs_b, counts_b, cos_b):
         '''gpgmm style NB'''
         with pyro.poutine.scale(scale=LOSS_SCALE):
+            comp_b = counts_b / counts_b.sum(-1,keepdims=True)
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
         
@@ -259,7 +269,7 @@ def run_model(
                 elif OBS_FAMILY=='poisson':
                     out_dist2 = dist.Poisson(rate=F.softmax(comp_logits,dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
                 elif OBS_FAMILY=='multinomial':
-                    out_dist2 = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=comp_logits
+                    out_dist2 = dist.Multinomial(total_count=counts_b.sum(-1).max().squeeze(), logits=comp_logits)
                 else:
                     raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
                 pyro.sample("obs_2",
@@ -267,8 +277,9 @@ def run_model(
                             obs=counts_b)
     
     
-    def guide(comp_b, id_b, grad_b, vecs_b, counts_b, cos_b): 
+    def guide(id_b, grad_b, vecs_b, counts_b, cos_b): 
         with pyro.poutine.scale(scale=LOSS_SCALE):
+            comp_b = counts_b / counts_b.sum(-1,keepdims=True)
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
             struct_loc   = pyro.param("struct_loc",   0.1*torch.randn(S, D, device=device))
@@ -308,15 +319,14 @@ def run_model(
         
         for epoch in tqdm.tqdm(range(1, num_epochs+1), desc=f"Epoch"):
             total_loss = 0.0
-            for comp_b, id_b_, grad_b, vecs_b, counts_b, cos_b in loader:
+            for id_b_, grad_b, vecs_b, counts_b, cos_b in loader:
                 # move each batch to device (they’re already on device, but safe):
-                comp_b   = comp_b.to(device)
                 id_b_    = id_b_.to(device)
                 grad_b   = grad_b.to(device)
                 vecs_b   = vecs_b.to(device)
                 counts_b = counts_b.to(device)
                 cos_b    = cos_b.to(device)
-                loss = svi.step(comp_b, id_b_, grad_b, vecs_b, counts_b, cos_b)
+                loss = svi.step(id_b_, grad_b, vecs_b, counts_b, cos_b)
                 total_loss += loss
                 losses.append(loss)
         
