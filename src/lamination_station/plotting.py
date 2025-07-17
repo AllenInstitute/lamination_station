@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
+from pandas.api.types import is_numeric_dtype
 
 def clip_latent_dimensions(matrix, x):
     """
@@ -35,6 +36,7 @@ def clip_latent_dimensions(matrix, x):
 
     return clipped_matrix
 
+
 def plot_cells_on_structure_graph(out,
                                   G,
                                   jitter=0.05,
@@ -46,18 +48,17 @@ def plot_cells_on_structure_graph(out,
                                   edge_scale=5.0,
                                   seed=0):
     """
-    Plots a force‐directed layout of the subset of structures
+    Plots a force-directed layout of the subset of structures
     that occur in out[['structure_pred1','structure_pred2']],
-    then scatters each cell along its predicted‐edge position,
-    colored by out[color_col].  Edges are drawn with width and
-    alpha proportional to their G.edges[u,v]['weight'].
+    then scatters each cell along its predicted-edge position,
+    colored by out[color_col] (handles both categorical and numeric).
 
     Parameters
     ----------
     out : pandas.DataFrame
         Must contain columns
           - 'structure_pred1', 'structure_pred2', 'phi'
-          - color_col (categorical or string)
+          - color_col (categorical or numeric)
     G : networkx.Graph
         Full graph of all structures; we'll induce the subgraph.
     jitter : float
@@ -67,21 +68,26 @@ def plot_cells_on_structure_graph(out,
     cell_alpha : float
         Alpha for cell points.
     color_col : str
-        Column in `out` to use for point hue.
+        Column in `out` to use for point hue (categorical or float).
     figsize : tuple
         Figure size passed to plt.subplots.
     spring_k : float or None
         Optimal node spacing for nx.spring_layout; if None, auto.
     edge_scale : float
-        Multiplier for edge line‐width.
+        Multiplier for edge line-width.
     seed : int
         Random seed for deterministic layout.
+
+    Returns
+    -------
+    scatter_artist, ax
+        The scatter artist (PathCollection) and the Axes.
     """
-    # 1) Induce subgraph on only used structure‐nodes
+    # 1) Induce subgraph on only used structure-nodes
     used = set(out['structure_pred1']).union(out['structure_pred2'])
     G_sub = G.subgraph(used).copy()
 
-    # 2) Compute a force‐directed (spring) layout
+    # 2) Compute a force-directed (spring) layout
     pos = nx.spring_layout(G_sub, k=spring_k, seed=seed)
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -91,22 +97,18 @@ def plot_cells_on_structure_graph(out,
         w = data.get('weight', 1.0)
         x1, y1 = pos[u]
         x2, y2 = pos[v]
-        ax.plot(
-            [x1, x2], [y1, y2],
-            color='gray',
-            linewidth=w * edge_scale,
-            alpha=w
-        )
+        ax.plot([x1, x2], [y1, y2],
+                color='gray',
+                linewidth=w * edge_scale,
+                alpha=w)
 
     # 4) Draw nodes & labels
-    nx.draw_networkx_nodes(
-        G_sub, pos, ax=ax,
-        node_color='lightblue',
-        node_size=300
-    )
+    nx.draw_networkx_nodes(G_sub, pos, ax=ax,
+                           node_color='lightblue',
+                           node_size=300)
     nx.draw_networkx_labels(G_sub, pos, ax=ax)
 
-    # 5) Compute each cell's (x,y) along its top‐2 edge
+    # 5) Compute each cell's (x,y) along its top-2 edge
     coords1 = np.array([pos[n] for n in out['structure_pred1']])
     coords2 = np.array([pos[n] for n in out['structure_pred2']])
     phi     = out['phi'].values[:, None]
@@ -115,26 +117,40 @@ def plot_cells_on_structure_graph(out,
     # 6) Add jitter
     pts += np.random.randn(*pts.shape) * jitter
 
-    # 7) Scatter, coloring by `color_col`
+    # 7) Scatter, coloring by `color_col` (categorical vs. numeric)
     cell_df = out.copy()
     cell_df['x_graph'], cell_df['y_graph'] = pts[:,0], pts[:,1]
 
-    seaborn.scatterplot(
-        ax=ax,
-        data=cell_df,
-        x='x_graph',
-        y='y_graph',
-        hue=color_col,
-        s=cell_size,
-        alpha=cell_alpha,
-        palette='tab20',
-        legend='full'
-    )
-    plt.legend(bbox_to_anchor=(1.05,1), loc="upper left")
+    if is_numeric_dtype(cell_df[color_col]):
+        # continuous numeric → use a colormap + colorbar
+        sc = ax.scatter(
+            cell_df['x_graph'], cell_df['y_graph'],
+            c=cell_df[color_col],
+            cmap='viridis',
+            s=cell_size,
+            alpha=cell_alpha
+        )
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label(color_col)
+        scatter = sc
+    else:
+        # categorical/string → seaborn with discrete palette & legend
+        scatter = seaborn.scatterplot(
+            ax=ax,
+            data=cell_df,
+            x='x_graph',
+            y='y_graph',
+            hue=color_col,
+            s=cell_size,
+            alpha=cell_alpha,
+            palette='tab20',
+            legend='full'
+        )
+        plt.legend(bbox_to_anchor=(1.05,1), loc="upper left")
+
     ax.set_axis_off()
     plt.tight_layout()
-    plt.show()
-
+    return scatter, ax
 
 def plot_loss(loss_tracker):
     '''Plots vector of values along with moving average'''
@@ -155,7 +171,7 @@ def plot_gradient_arrows(df_grads,gradients,taxon,x_col,y_col,xlim=None,ylim=Non
     # 3) compute alphas from your gradient_norm
     norms = df_grads['gradient_norm']
     alphas = norms / norms.max()
-    
+    alphas = np.nan_to_num(alphas)
     # 4) build your color mapping off of df_grads
     unique_types = df_grads.loc[mask, taxon].unique()
     cmap = list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102)

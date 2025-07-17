@@ -13,6 +13,11 @@ from torch.utils.data import WeightedRandomSampler, DataLoader, TensorDataset
 from pyro.infer import SVI, TraceEnum_ELBO
 from pyro.optim import Adam
 
+def safe_softmax(x,dim=-1,eps=1e-10):
+    x=torch.softmax(x,dim)
+    x=x+eps
+    return (x/x.sum(dim,keepdim=True))
+
 class Encoder(PyroModule):
     def __init__(self, input_dim, hidden_dim, latent_dim):
         super().__init__()
@@ -224,7 +229,7 @@ def run_model(
                                            .to_event(2))
             struct_comp  = pyro.param("struct_comp", 0.1*torch.randn(S, T, device=device))
             theta_a = pyro.param('theta_a',torch.zeros(1,device=device))
-            theta_b = pyro.param('theta_b',100*torch.ones(1,device=device))
+            theta_b = pyro.param('theta_b',100*torch.ones((1,T),device=device))
             
             with pyro.plate("cells", B):
                 # — sample structure & z as before —
@@ -234,16 +239,16 @@ def run_model(
                 μ_s = struct_loc[s]
                 σ_s = struct_scale[s]
                 z   = pyro.sample("z",
-                                  dist.Normal(μ_s, σ_s).to_event(1))
+                                  dist.Normal(μ_s, σ_s+1e-6).to_event(1))
         
                 mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
                 rate      = decoder(z, comp_b, id_b, cos_b, mean_dist)
-                theta = F.softplus(theta_b + theta_a*(mean_dist+1e-6))
+                theta = F.softplus(theta_b + theta_a*(mean_dist)) + 1e-6
         
                 if OBS_FAMILY=='nb':
                     out_dist = dist.NegativeBinomial(total_count=theta,logits=rate - torch.logsumexp(rate,-1,keepdim=True) + counts_b.sum(-1).unsqueeze(-1).log() - theta.log()).to_event(1)
                 elif OBS_FAMILY=='poisson':
-                    out_dist = dist.Poisson(rate=F.softmax(rate, dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
+                    out_dist = dist.Poisson(rate=safe_softmax(rate, dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
                 elif OBS_FAMILY=='multinomial':
                     out_dist = dist.Multinomial(total_count=int(counts_b.sum(-1).max().squeeze()), logits=rate)
                 else:
@@ -267,7 +272,7 @@ def run_model(
                 if OBS_FAMILY=='nb':
                     out_dist2 = dist.NegativeBinomial(total_count=theta,logits=comp_logits - torch.logsumexp(comp_logits,-1,keepdim=True) + counts_b.sum(-1).unsqueeze(-1).log() - theta.log()).to_event(1)
                 elif OBS_FAMILY=='poisson':
-                    out_dist2 = dist.Poisson(rate=F.softmax(comp_logits,dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
+                    out_dist2 = dist.Poisson(rate=safe_softmax(comp_logits,dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
                 elif OBS_FAMILY=='multinomial':
                     out_dist2 = dist.Multinomial(total_count=int(counts_b.sum(-1).max().squeeze()), logits=comp_logits)
                 else:
@@ -296,10 +301,10 @@ def run_model(
                 mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
                 x_enc     = torch.cat([comp_b, id_b, grad_b, cos_b, mean_dist], dim=-1)
                 μ_z, σ_z  = encoder(x_enc)
-                z = pyro.sample("z", dist.Normal(μ_z, σ_z).to_event(1))
+                z = pyro.sample("z", dist.Normal(μ_z, σ_z+1e-6).to_event(1))
         
                 logits_s  = classifier(z)  
-                phi_q = F.softmax(classifier(z), dim=-1)
+                phi_q = safe_softmax(logits_s, dim=-1)
                 phi_q = phi_q+1e-6
                 phi_q = (phi_q/phi_q.sum(-1)[...,None]).squeeze()
                 pyro.sample("phi",
@@ -330,7 +335,7 @@ def run_model(
                 total_loss += loss
                 losses.append(loss)
         
-            if epoch % 50 ==0:
+            if epoch % 100 ==0:
                 avg_loss = total_loss / len(loader)
                 print(f"[Epoch {epoch:02d}] avg ELBO loss: {avg_loss:.2f}")
     

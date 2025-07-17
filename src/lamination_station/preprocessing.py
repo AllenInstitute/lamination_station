@@ -71,27 +71,29 @@ def calculate_comp_grads(
     # 1a) apply quantile‐thresholding if requested --------------------
     # build per-cell lists of neighbor indices & (for far) distances
     if near_quantile is not None:
-        thresh_near = np.quantile(distances_near, near_quantile, axis=1)
+        # 1) global threshold over EVERY cell's near‐distances
+        global_near_thresh = np.quantile(distances_near.ravel(), near_quantile)
         neighbor_indices_near = [
-            indices_near[i][distances_near[i] <= thresh_near[i]]
+            indices_near[i][distances_near[i] <= global_near_thresh]
             for i in range(n_cells)
         ]
     else:
         neighbor_indices_near = [indices_near[i] for i in range(n_cells)]
 
     if far_quantile is not None:
-        thresh_far = np.quantile(distances_far, far_quantile, axis=1)
+        global_far_thresh = np.quantile(distances_far.ravel(), far_quantile)
         neighbor_indices_far = [
-            indices_far[i][distances_far[i] <= thresh_far[i]]
+            indices_far[i][distances_far[i] <= global_far_thresh]
             for i in range(n_cells)
         ]
         neighbor_distances_far = [
-            distances_far[i][distances_far[i] <= thresh_far[i]]
+            distances_far[i][distances_far[i] <= global_far_thresh]
             for i in range(n_cells)
         ]
     else:
-        neighbor_indices_far = [indices_far[i] for i in range(n_cells)]
-        neighbor_distances_far = [distances_far[i] for i in range(n_cells)]
+        neighbor_indices_far     = [indices_far[i]     for i in range(n_cells)]
+        neighbor_distances_far  = [distances_far[i]  for i in range(n_cells)]
+
 
     # 2) SETUP ----------------------------------------------------------
     df[celltype_col] = df[celltype_col].astype('category')
@@ -170,35 +172,24 @@ def calculate_comp_grads(
         neigh = neighbor_indices_far[i]
         if len(neigh) == 0:
             continue
-        neigh_cv = comp_vectors[neigh]
+    
+        comp_i    = comp_vectors[i]             # (n_types,)
+        comp_n    = comp_vectors[neigh]         # (n_neigh, n_types)
+        diffs     = np.linalg.norm(comp_n - comp_i, axis=1)  # scalar change per neighbor
+    
         dx = X_scaled[neigh,0] - X_scaled[i,0]
         dy = X_scaled[neigh,1] - X_scaled[i,1]
-
-        ang  = np.arctan2(dy, dx)
-        bins = np.linspace(-np.pi, np.pi, n_bins+1)
-        dig  = np.digitize(ang, bins) - 1
-        bc   = np.bincount(dig, minlength=n_bins)
-        mn   = np.mean(np.hypot(dx, dy))
-        pseudo = np.full((n_bins, n_types), mn)
-
-        for b in range(n_bins):
-            if bc[b] == 0:
-                neigh_cv = np.vstack([neigh_cv, pseudo[b]])
-                dx  = np.append(dx, mn)
-                dy  = np.append(dy, mn)
-                dig = np.append(dig, b)
-                bc[b] += 1
-
-        w = 1.0 / (bc[dig] + eps)
-        w /= w.sum()
-        dx[dx == 0] = eps * np.sign(dx[dx == 0])
-        dy[dy == 0] = eps * np.sign(dy[dy == 0])
-
-        dV = neigh_cv - comp_vectors[[i]]
-        gx = (np.abs(dV) * w[:,None] / dx[:,None]).sum()
-        gy = (np.abs(dV) * w[:,None] / dy[:,None]).sum()
-        gradients[i,0] = gx
-        gradients[i,1] = np.abs(gy) if absgrad else gy
+        dist = np.hypot(dx, dy) + eps
+    
+        # unit direction to each neighbor
+        uv = np.column_stack((dx, dy)) / dist[:,None]
+    
+        # weight each neighbor by how big the composition jump is / distance
+        w  = diffs / dist
+    
+        # weighted sum of unit vectors
+        gv = (w[:,None] * uv).sum(axis=0)
+        gradients[i] = gv / (w.sum() + eps)
 
     df_grads = df.copy()
     norms = np.linalg.norm(gradients, axis=1)
