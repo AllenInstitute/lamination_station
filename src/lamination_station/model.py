@@ -73,7 +73,9 @@ def run_model(
     HIDDEN_DIM_CLASSIFIER = 128,
     device = 'cpu',
     clear_params = True,
-    normalize_sampling = True
+    normalize_sampling = True,
+    num_particles = 3,
+    ignore_cur_type = False
 ):
     """
     Train a Pyro-based variational model to infer latent spatial structures
@@ -169,9 +171,8 @@ def run_model(
     id_arr       = np.zeros((N, id_dim), dtype=float)
     type_to_ix   = {t:i for i,t in enumerate(unique_types)}
     for i,t in enumerate(cell_types):
-        id_arr[i, type_to_ix[t]] = 1.0
+        id_arr[i, type_to_ix[t]] = 1. if not ignore_cur_type else 0.
     id_b = torch.tensor(id_arr, dtype=torch.float, device=device,requires_grad=False)
-    
     # ──────────────── DataLoader ────────────────
     # dataset = TensorDataset(id_b, grads, type_vecs, counts, grad_type_cos)
     # loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
@@ -320,7 +321,7 @@ def run_model(
 
     for lr_step in lr_steps:
         optimizer = Adam({"lr": lr_step})
-        svi       = SVI(unified_model, guide, optimizer, loss=TraceEnum_ELBO())
+        svi       = SVI(unified_model, guide, optimizer, loss=TraceEnum_ELBO(num_particles=num_particles))
         
         for epoch in tqdm.tqdm(range(1, num_epochs+1), desc=f"Epoch"):
             total_loss = 0.0
