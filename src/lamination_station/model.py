@@ -340,39 +340,44 @@ def run_model(
                 avg_loss = total_loss / len(loader)
                 print(f"[Epoch {epoch:02d}] avg ELBO loss: {avg_loss:.2f}")
     
-    # ─────────────── 4) Posterior Extraction ───────────────
-    # a) Compute the amortized posterior means for z via the encoder
-    #    (guide assumes z ~ Normal(loc, scale), so loc is the mean)
-    mean_dist_full = type_vecs.norm(dim=-1).mean(dim=-1, keepdim=True)
-    X_full = torch.cat([comp, id_b, grads, mean_dist_full, grad_type_cos], dim=1)
-    loc_full, scale_full = encoder(X_full)
-    z_pred = loc_full.detach()                        # (N, latent_dim)
+    encoder.eval(); classifier.eval()
+    with torch.no_grad():
+        N = counts.size(0)
+        mean_dist_full = type_vecs.norm(dim=-1).mean(dim=-1, keepdim=True)
 
-    # b) compute classifier probs and take top-2
-    logits_s = classifier(z_pred)                     # (N, S)
-    probs_s = torch.softmax(logits_s, dim=1)
-    top2_p, top2_idx = probs_s.topk(2, dim=1)         # each is (N,2)
-    # phi = p1/(p1+p2)
-    phi = (top2_p[:,0] / top2_p.sum(dim=1)).cpu().detach().numpy()
-    pred1 = top2_idx[:,0].cpu().detach().numpy()
-    pred2 = top2_idx[:,1].cpu().detach().numpy()
+        z_pred_np      = np.zeros((N, LATENT_DIM), dtype=np.float32)
+        logits_s_np    = np.zeros((N, NUM_STRUCTURES), dtype=np.float32)
+        pred1_np       = np.zeros(N, dtype=np.int64)
+        pred2_np       = np.zeros(N, dtype=np.int64)
+        phi_np         = np.zeros(N, dtype=np.float32)
 
-    # c) nearest‐mean assignment (unchanged)
-    struct_loc = pyro.param("struct_loc").detach()
-    dists = torch.cdist(z_pred, struct_loc)
-    struct_nearest = torch.argmin(dists, dim=1).cpu().detach().numpy()
+        idx_all   = torch.arange(N)
+        infer_set = TensorDataset(idx_all, id_b, grads, type_vecs, counts, grad_type_cos, mean_dist_full)
+        infer_loader = DataLoader(infer_set, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    z_pred = loc_full.cpu().detach().numpy()                      # (N, latent_dim)
+        for idx_b, id_b_, grad_b, vecs_b, counts_b, cos_b, md_b in infer_loader:
+            comp_b = (counts_b / counts_b.sum(-1, keepdims=True)).nan_to_num(0.)
+            X_b    = torch.cat([comp_b, id_b_, grad_b, cos_b, md_b], dim=1).to(device)
+
+            loc_b, _ = encoder(X_b)
+            z_b      = loc_b
+            logits_b = classifier(z_b)
+            probs_b  = torch.softmax(logits_b, dim=1)
+            top2_p_b, top2_idx_b = probs_b.topk(2, dim=1)
+
+            i = idx_b.cpu().numpy()
+            z_pred_np[i]   = z_b.cpu().numpy()
+            logits_s_np[i] = logits_b.cpu().numpy()
+            pred1_np[i]    = top2_idx_b[:, 0].cpu().numpy()
+            pred2_np[i]    = top2_idx_b[:, 1].cpu().numpy()
+            phi_np[i]      = (top2_p_b[:, 0] / top2_p_b.sum(dim=1)).cpu().numpy()
+
+
     out = df_grads.copy()
     for d in range(LATENT_DIM):
-        out[f"z{d+1}"] = z_pred[:,d]
-    # replace old single‐best
-    # out["structure_pred"] = struct_pred
-    out["structure_pred1"] = pred1#[str(x) for x in pred1]
-    out["structure_pred2"] = pred2#[str(x) for x in pred2]
-    out["phi"]             = phi
-    out["structure_pred_nearest"] = struct_nearest#[str(x) for x in struct_nearest]
-    out["structure_pred1"] = out["structure_pred1"].astype('category')
-    out["structure_pred2"] = out["structure_pred2"].astype('category')
-    out["structure_pred_nearest"] = out["structure_pred_nearest"].astype('category')
-    return out,logits_s.cpu().detach().numpy(),torch.softmax(pyro.param('struct_comp').cpu().detach(),-1).numpy(),losses
+        out[f"z{d+1}"] = z_pred_np[:, d]
+    out["structure_pred1"]        = pd.Categorical(pred1_np)
+    out["structure_pred2"]        = pd.Categorical(pred2_np)
+    out["phi"]                    = phi_np
+
+    return out, logits_s_np, torch.softmax(pyro.param('struct_comp').cpu().detach(), -1).numpy(), losses
