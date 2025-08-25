@@ -12,8 +12,6 @@ import pyro.optim as optim
 from torch.utils.data import WeightedRandomSampler, DataLoader, TensorDataset
 from pyro.infer import SVI, TraceEnum_ELBO
 from pyro.optim import Adam
-from pyro.ops.indexing import Vindex
-
 
 def safe_softmax(x,dim=-1,eps=1e-10):
     x=torch.softmax(x,dim)
@@ -68,7 +66,6 @@ def run_model(
     lr_steps = [1e-3,1e-4,1e-5],
     batch_size     = 1024,
     STRUCT_SCALE_SCALE = 0.1, #Strength of regularization on latent space dispersion
-    OBS_FAMILY = "nb", #must be 'nb','poisson' or 'multinomial'
     STRUCT_LOC_PRIOR_SCALE = 1., #Strength of regularization on more structures
     LOSS_SCALE = 1., #Multiply all ELBO by this factor (can increase stability if too high or too low)
     HIDDEN_DIM = 512,
@@ -203,7 +200,7 @@ def run_model(
     
     
     # ──────────────── Build & Register Modules ────────────────
-    input_dim = T + id_dim + id_dim + 2 + 1
+    input_dim = T + id_dim + 2 + 1
     if clear_params:
         pyro.clear_param_store()
     encoder    = Encoder(input_dim=input_dim, hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM).to(device)
@@ -215,157 +212,93 @@ def run_model(
     pyro.module("classifier", classifier)
     pyro.module("decoder",    decoder)
     
-    def _mask_out(logits, idx):
-        # logits: (..., S) ; idx: (...) long (can carry enum dims)
-        neg_inf = torch.finfo(logits.dtype).min
-        mask = F.one_hot(idx, logits.size(-1)).to(logits.dtype)
-        return logits + mask * neg_inf
-        
-    def left_expand(t, target_ndim):
-        return t[(None,) * (target_ndim - t.dim()) + (...,)] if t.dim() < target_ndim else t
-
     def unified_model(id_b, grad_b, vecs_b, counts_b, cos_b):
+        '''gpgmm style NB'''
         with pyro.poutine.scale(scale=LOSS_SCALE):
-            comp_b = (counts_b / counts_b.sum(-1, keepdims=True)).detach()
+            comp_b = (counts_b / counts_b.sum(-1,keepdims=True)).detach()
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
-    
-            struct_loc = pyro.param("struct_loc", 0.1*torch.randn(S, D, device=device))
-            struct_loc = pyro.sample(
-                "struct_loc_sample",
-                dist.Laplace(torch.zeros(S, D, device=device),
-                             STRUCT_LOC_PRIOR_SCALE*torch.ones(S, D, device=device)).to_event(2)
-            )
-            struct_scale = pyro.sample(
-                "struct_scale_sample",
-                dist.HalfCauchy(STRUCT_SCALE_SCALE*torch.ones(S, D, device=device)).to_event(2)
-            )
-            struct_comp = pyro.param("struct_comp", 0.1*torch.randn(S, T, device=device))
-            theta_a = pyro.param('theta_a', torch.zeros(1, device=device))
-            theta_b = pyro.param('theta_b', 100*torch.ones((1, T), device=device))
-    
+        
+            # 1) struct_loc & struct_scale as before
+            struct_loc   = pyro.param("struct_loc",   0.1*torch.randn(S, D, device=device))
+            struct_loc = pyro.sample("struct_loc_sample",
+                                       dist.Laplace(torch.zeros(S, D, device=device),STRUCT_LOC_PRIOR_SCALE*torch.ones(S, D, device=device))
+                                           .to_event(2))
+            struct_scale = pyro.sample("struct_scale_sample",
+                                       dist.HalfCauchy(STRUCT_SCALE_SCALE*torch.ones(S, D, device=device))
+                                           .to_event(2))
+            struct_comp  = pyro.param("struct_comp", 0.1*torch.randn(S, T, device=device))
+            theta_a = pyro.param('theta_a',torch.zeros(1,device=device))
+            theta_b = pyro.param('theta_b',100*torch.ones((1,T),device=device))
+            
             with pyro.plate("cells", B):
-                # Prior over mixture weights used to set the 2-component mixing
-                phi = pyro.sample("phi", dist.Dirichlet(torch.ones(B, S, device=device)))
-    
-                # First categorical (uniform prior here; change if you prefer)
-                logits_prior = torch.zeros(B, S, device=device)
-                w1 = pyro.sample(
-                    "structure_1",
-                    dist.OneHotCategorical(logits=logits_prior),
-                    infer={"enumerate": "parallel"}
-                )
-                s1 = w1.argmax(-1)
-                # Second categorical: mask out s1
-                logits2 = _mask_out(logits_prior, s1)
-                w2 = pyro.sample(
-                    "structure_2",
-                    dist.OneHotCategorical(logits=logits2),
-                    infer={"enumerate": "parallel"}
-                )
-                s2 = w2.argmax(-1)
+                s  = pyro.sample("structure",
+                                 dist.Categorical(torch.ones(B, S, device=device)),
+                                 infer={"enumerate":"parallel"})
 
-                a1 = (phi * w1).sum(-1)                  # phi[s1]
-                a2 = (phi * w2).sum(-1)                  # phi[s2]
-                den = a1 + a2 + 1e-8
-                w_mix1 = a1 / den
-                w_mix2 = a2 / den
-                
-                # select rows via one-hot matmul
-                loc1  = w1 @ struct_loc                  # [enum..., B, D]
-                loc2  = w2 @ struct_loc
-                var1  = w1 @ struct_scale.pow(2)
-                var2  = w2 @ struct_scale.pow(2)
-                
-                # mixture moment-matching
-                μ_s = w_mix1.unsqueeze(-1)*loc1 + w_mix2.unsqueeze(-1)*loc2
-                # this is for true mixture of gaussians, which I don't think is correct here
-                # var_s = (w_mix1.unsqueeze(-1)*(var1 + (loc1 - μ_s).pow(2)) +
-                #          w_mix2.unsqueeze(-1)*(var2 + (loc2 - μ_s).pow(2)))
-                var_s = (w_mix1.unsqueeze(-1)*(var1) +
-                         w_mix2.unsqueeze(-1)*(var2))
-                σ_s = (var_s + 1e-6).sqrt()
-                
-                # discrete head: mix in probability space, not in logit space
-                p1 = F.softmax(w1 @ struct_comp, dim=-1)
-                p2 = F.softmax(w2 @ struct_comp, dim=-1)
-                p_mix = w_mix1.unsqueeze(-1)*p1 + w_mix2.unsqueeze(-1)*p2
-                comp_logits = (p_mix + 1e-12).log()      # log-probs for your downstream NB/Poisson logic
+                phi = pyro.sample("phi",
+                    dist.Dirichlet(torch.ones(B, S, device=device)))
+        
+                # 2) pick top-2 probs and their indices
+                top2_p, top2_idx = phi.topk(2, dim=1)  # both shape (B, 2)
+        
+                # 3) normalize to mixture weights
+                mix_w = top2_p / top2_p.sum(dim=1, keepdim=True)  # (B, 2)
 
-                z = pyro.sample("z", dist.Normal(μ_s, σ_s + 1e-6).to_event(1))
-    
+                μ_s = (struct_loc[top2_idx] * mix_w.unsqueeze(-1)).sum(1) #struct_loc[s]
+                σ_s = (struct_scale[top2_idx]**2 * mix_w.unsqueeze(-1)).sum(1)**0.5
+                z   = pyro.sample("z",
+                                  dist.Normal(μ_s, σ_s+1e-6).to_event(1))
+        
                 mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
-                rate = decoder(z, mean_dist)
+                rate      = decoder(z, mean_dist)
                 theta = F.softplus(theta_b + theta_a*(mean_dist)) + 1e-6
+                # print(rate.argmax(1))
+                out_dist = dist.OneHotCategorical(logits=rate)
+                pyro.sample("obs",
+                            out_dist,
+                            obs=id_b)
+                
+                # 4) gather the corresponding struct_comp logits → (B, 2, T)
+                comp_logits = (struct_comp[top2_idx] * mix_w.unsqueeze(-1)).sum(1)
+                # print(id_b.argmax(1))
+                # print(comp_logits.argmax(1))
+                out_dist2 = dist.OneHotCategorical(logits=comp_logits)
+                pyro.sample("obs_2",
+                            out_dist2,
+                            obs=id_b)
     
-                if OBS_FAMILY == 'nb':
-                    logits = rate - torch.logsumexp(rate, -1, keepdim=True) \
-                             + counts_b.sum(-1).unsqueeze(-1).log() - theta.log()
-                    out_dist = dist.NegativeBinomial(total_count=theta, logits=logits).to_event(1)
-                elif OBS_FAMILY == 'poisson':
-                    out_dist = dist.Poisson(rate=safe_softmax(rate, dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
-                elif OBS_FAMILY == 'multinomial':
-                    out_dist = dist.Multinomial(total_count=int(counts_b.sum(-1).max().squeeze()), logits=rate)
-                else:
-                    raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
-                pyro.sample("obs", out_dist, obs=counts_b)
     
-                # comp_logits = (torch.stack([Vindex(struct_comp)[s1, :],
-                #                             Vindex(struct_comp)[s2, :]], dim=1)
-                #                * mix_w.unsqueeze(-1)).sum(1)
-    
-                if OBS_FAMILY == 'nb':
-                    logits2 = comp_logits - torch.logsumexp(comp_logits, -1, keepdim=True) \
-                              + counts_b.sum(-1).unsqueeze(-1).log() - theta.log()
-                    out_dist2 = dist.NegativeBinomial(total_count=theta, logits=logits2).to_event(1)
-                elif OBS_FAMILY == 'poisson':
-                    out_dist2 = dist.Poisson(rate=safe_softmax(comp_logits, dim=-1)*counts_b.sum(-1).unsqueeze(-1)).to_event(1)
-                elif OBS_FAMILY == 'multinomial':
-                    out_dist2 = dist.Multinomial(total_count=int(counts_b.sum(-1).max().squeeze()), logits=comp_logits)
-                else:
-                    raise ValueError(f"Unsupported OBS_FAMILY: {OBS_FAMILY!r}")
-                pyro.sample("obs_2", out_dist2, obs=counts_b)
-    
-    def guide(id_b, grad_b, vecs_b, counts_b, cos_b):
+    def guide(id_b, grad_b, vecs_b, counts_b, cos_b): 
         with pyro.poutine.scale(scale=LOSS_SCALE):
-            comp_b = counts_b / counts_b.sum(-1, keepdims=True)
+            comp_b = counts_b / counts_b.sum(-1,keepdims=True)
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
-    
-            struct_loc = pyro.param("struct_loc", 0.1*torch.randn(S, D, device=device))
-            pyro.sample("struct_loc_sample", dist.Delta(struct_loc).to_event(2))
-    
+            struct_loc   = pyro.param("struct_loc",   0.1*torch.randn(S, D, device=device))
+            struct_loc = pyro.sample("struct_loc_sample",
+                                       dist.Delta(struct_loc)
+                                           .to_event(2))
             struct_scale_param = pyro.param("struct_scale",
                                             torch.ones(S, D, device=device),
                                             constraint=dist.constraints.positive)
-            pyro.sample("struct_scale_sample", dist.Delta(struct_scale_param).to_event(2))
-    
+            pyro.sample("struct_scale_sample",
+                        dist.Delta(struct_scale_param).to_event(2))
+        
             with pyro.plate("cells", B):
                 mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
-                x_enc = torch.cat([comp_b, id_b, grad_b, cos_b, mean_dist], dim=-1)
-                μ_z, σ_z = encoder(x_enc)
-                z = pyro.sample("z", dist.Normal(μ_z, σ_z + 1e-6).to_event(1))
-    
-                logits_s = classifier(z)  # (B, S)
-    
-                # q(phi) as a point mass at softmax(classifier)
+                x_enc     = torch.cat([comp_b, grad_b, cos_b, mean_dist], dim=-1)
+                μ_z, σ_z  = encoder(x_enc)
+                z = pyro.sample("z", dist.Normal(μ_z, σ_z+1e-6).to_event(1))
+        
+                logits_s  = classifier(z)  
                 phi_q = safe_softmax(logits_s, dim=-1)
-                pyro.sample("phi", dist.Delta(phi_q).to_event(1))
-    
-                # First enumerated pick from classifier
-                w1 = pyro.sample(
-                    "structure_1",
-                    dist.OneHotCategorical(logits=logits_s),
-                    infer={"enumerate": "parallel"}
-                )
-                s1 = w1.argmax(-1)
-                # Second pick with s1 masked out, then re-normalized by Categorical
-                logits_s2 = _mask_out(logits_s, s1)
-                w2 = pyro.sample(
-                    "structure_2",
-                    dist.OneHotCategorical(logits=logits_s2),
-                    infer={"enumerate": "parallel"}
-                )
+                phi_q = phi_q+1e-6
+                phi_q = (phi_q/phi_q.sum(-1)[...,None]).squeeze()
+                pyro.sample("phi",
+                    dist.Delta(phi_q).to_event(1))
+                pyro.sample("structure",
+                            dist.Categorical(logits=logits_s),
+                            infer={"enumerate":"parallel"})
     
     
     if clear_params:
@@ -410,7 +343,7 @@ def run_model(
 
         for idx_b, id_b_, grad_b, vecs_b, counts_b, cos_b, md_b in infer_loader:
             comp_b = (counts_b / counts_b.sum(-1, keepdims=True)).nan_to_num(0.)
-            X_b    = torch.cat([comp_b, id_b_, grad_b, cos_b, md_b], dim=1).to(device)
+            X_b    = torch.cat([comp_b, grad_b, cos_b, md_b], dim=1).to(device)
 
             loc_b, _ = encoder(X_b)
             z_b      = loc_b
