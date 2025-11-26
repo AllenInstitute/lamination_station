@@ -31,32 +31,20 @@ class Encoder(PyroModule):
         sd = F.softplus(self.scale(h)) + 1e-4
         return mu, sd
 
-def gaussian_log_overlap_full(mu_q, var_q_diag, mus, scale_trils, jitter=1e-6):
+def rbf_log_overlap(mu_q, var_q_diag, struct_loc, lengthscales, eps=1e-6):
     """
-    mu_q:       (B,D)
-    var_q_diag: (B,D)
-    mus:        (S,D)
-    scale_trils:(S,D,D) with Sigma_k = L_k L_k^T
-    returns:    (B,S) log inner-products N(mu_q; mu_k, Sigma_k + diag(var_q))
+    Diagonal-Gaussian overlap (ARD RBF) in log-space.
+    Equivalent to MVN inner product with Σ_k = diag(lengthscales_k^2),
+    Σ_q = diag(var_q_diag), up to an additive constant.
     """
-    B, D = mu_q.shape
-    S = mus.size(0)
-    c = D * torch.log(torch.tensor(2.0 * torch.pi, device=mu_q.device))
-    diagQ = torch.diag_embed(var_q_diag)  # (B,D,D)
-    logw = []
-    I = torch.eye(D, device=mu_q.device).expand(B, D, D)
-    for k in range(S):
-        Sigma_k = scale_trils[k] @ scale_trils[k].transpose(-1, -2)     # (D,D)
-        S_b = Sigma_k.expand(B, D, D) + diagQ                           # (B,D,D)
-        S_b = 0.5*(S_b + S_b.transpose(-1, -2)) + jitter*I
-        L = torch.linalg.cholesky(S_b)                                  # (B,D,D)
-        logdet = 2.0*torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)  # (B,)
-        d = (mu_q - mus[k].expand(B, D)).unsqueeze(-1)                  # (B,D,1)
-        y = torch.linalg.solve_triangular(L, d, upper=False)
-        z = torch.linalg.solve_triangular(L.transpose(-1, -2), y, upper=True)
-        quad = (d.squeeze(-1) * z.squeeze(-1)).sum(-1)                  # (B,)
-        logw.append(-0.5*(c + logdet + quad))
-    return torch.stack(logw, dim=1)  # (B,S)
+    # mu_q: (B,D), var_q_diag: (B,D), struct_loc: (S,D), lengthscales: (S,D)
+    diff = mu_q[:, None, :] - struct_loc[None, :, :]                     # (B,S,D)
+    eff_var = (lengthscales**2)[None, :, :] + var_q_diag[:, None, :]     # (B,S,D)
+    eff_var = eff_var.clamp_min(eps)
+    quad = (diff**2 / eff_var).sum(-1)                                   # (B,S)
+    log_norm = 0.5 * eff_var.log().sum(-1)                               # (B,S)
+    return -0.5 * quad - log_norm                                        # (B,S)
+
 
 def run_model(
     df_grads,
@@ -122,17 +110,12 @@ def run_model(
 
             struct_loc = pyro.sample(
                 "struct_loc",
-                dist.Laplace(torch.zeros(S, D, device=device),
+                dist.Normal(torch.zeros(S, D, device=device),
                              STRUCT_LOC_PRIOR_SCALE*torch.ones(S, D, device=device)).to_event(2)
             )
-            # full covariances via lower-triangular factors (MAP in guide)
-            struct_L = pyro.sample(
-                "struct_L",
-                dist.LKJCholesky(D, 1.0*torch.ones(1,device=device)).expand([S]).to_event(1)
-            )
-            struct_scales = pyro.sample(
-                "struct_scales",
-                dist.HalfNormal(0.5*torch.ones(S, D, device=device)).to_event(2)
+            struct_log_ls = pyro.sample(  # log-lengthscales for positivity & heavy-tail prior
+                "struct_log_ls",
+                dist.Laplace(torch.zeros(S, D, device=device), 0.5*torch.ones(S, D, device=device)).to_event(2)
             )
 
             struct_comp_logits = pyro.param("struct_comp_logits",
@@ -166,28 +149,30 @@ def run_model(
         with pyro.poutine.scale(scale=LOSS_SCALE):
             B = counts_b.size(0)
             D, S, Tloc = LATENT_DIM, NUM_STRUCTURES, counts_b.size(1)
-            struct_loc_param = pyro.param("struct_loc_param", torch.randn(S, D, device=device))
+            struct_loc_param = pyro.param("struct_loc_param", 0.1*torch.randn(S, D, device=device))
             pyro.sample("struct_loc", dist.Delta(struct_loc_param).to_event(2))
-
-            struct_L_param = pyro.param("struct_L_param",
-                                        torch.eye(D, device=device).expand(S, D, D).clone(),
-                                        constraint=constraints.corr_cholesky)
-            pyro.sample("struct_L", dist.Delta(struct_L_param).to_event(3))
+            
+            struct_log_ls_param = pyro.param(
+                "struct_log_ls_param",
+                torch.zeros(S, D, device=device),
+                constraint=constraints.real
+            )
+            pyro.sample("struct_log_ls", dist.Delta(struct_log_ls_param).to_event(2))
 
             struct_scales_param = pyro.param("struct_scales_param",
                                              0.5*torch.ones(S, D, device=device),
                                              constraint=constraints.positive)
-            struct_scales = pyro.sample("struct_scales", dist.Delta(struct_scales_param).to_event(2))
 
             comp_b = counts_b / counts_b.sum(-1, keepdim=True).clamp_min(1.0)
             mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
             x_enc = torch.cat([comp_b, id_b, grad_b, cos_b, mean_dist], dim=-1)
             mu_q, sd_q = encoder(x_enc)
             var_q = sd_q**2
-
-            # scale_tril = torch.matmul(torch.diag_embed(struct_scales_param), struct_L_param)  # (S,D,D)
-            scale_tril = struct_L_param * struct_scales.unsqueeze(-1)
-            logw = gaussian_log_overlap_full(mu_q, var_q, struct_loc_param, scale_tril)       # (B,S)
+            
+            # kernel overlap
+            lengthscales = torch.exp(struct_log_ls_param)  # (S,D), positive
+            logw = rbf_log_overlap(mu_q, var_q, struct_loc_param, lengthscales)  # (B,S)
+                        
             phi = safe_softmax(logw, dim=-1)
             with pyro.plate("cells", B):
                 pyro.sample("phi", dist.Delta(phi).to_event(1))
@@ -225,11 +210,10 @@ def run_model(
         pred1_np  = np.zeros(N, dtype=np.int64)
         pred2_np  = np.zeros(N, dtype=np.int64)
         phi1_np   = np.zeros(N, dtype=np.float32)
+        lengthscales = torch.exp(pyro.param('struct_log_ls_param'))
 
         struct_loc = pyro.param("struct_loc_param")
-        struct_L   = pyro.param("struct_L_param")
-        struct_scales  = pyro.param("struct_scales_param")
-        scale_tril = struct_L * struct_scales.unsqueeze(-1)  #torch.matmul(torch.diag_embed(struct_sc), struct_L)  # (S,D,D)
+        struct_sc  = pyro.param("struct_scales_param")
         comp_probs = torch.softmax(pyro.param("struct_comp_logits"), dim=-1)  # (S,T)
 
         for idx_b, id_b_, grad_b, vecs_b, counts_b, cos_b, md_b in infer_loader:
@@ -238,7 +222,7 @@ def run_model(
             mu_q, sd_q = encoder(X_b)
             var_q = sd_q**2
 
-            logw = gaussian_log_overlap_full(mu_q, var_q, struct_loc, scale_tril)  # (B,S)
+            logw = rbf_log_overlap(mu_q, var_q, struct_loc,lengthscales)  # (B,S)
             phi_b = torch.softmax(logw, dim=-1)                                     # (B,S)
             mix_b = phi_b @ comp_probs                                               # (B,T)
 

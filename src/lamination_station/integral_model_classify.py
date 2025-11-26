@@ -7,10 +7,11 @@ import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
 from pyro.nn import PyroModule
-from pyro.infer import SVI, JitTrace_ELBO
+from pyro.infer import SVI, TraceEnum_ELBO
 from pyro.optim import Adam
 from torch.utils.data import WeightedRandomSampler, DataLoader, TensorDataset
 from torch.distributions import constraints
+from pyro.ops.indexing import Vindex
 
 def safe_softmax(x,dim=-1,eps=1e-10):
     x=torch.softmax(x,dim)
@@ -30,6 +31,18 @@ class Encoder(PyroModule):
         mu = self.loc(h)
         sd = F.softplus(self.scale(h)) + 1e-4
         return mu, sd
+
+class Classifier(PyroModule):
+    def __init__(self, latent_dim, hidden_dim, num_structures):
+        super().__init__()
+        self.fc1 = nn.Linear(latent_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, num_structures)
+    def forward(self, z):
+        h = F.relu(self.fc1(z))
+        h = F.relu(self.fc2(h))
+        return self.out(h)
+
 
 def gaussian_log_overlap_full(mu_q, var_q_diag, mus, scale_trils, jitter=1e-6):
     """
@@ -73,6 +86,7 @@ def run_model(
     STRUCT_LOC_PRIOR_SCALE=1.0,
     LOSS_SCALE=1.0,
     HIDDEN_DIM=512,
+    HIDDEN_DIM_CLASSIFIER = 128,
     device="cpu",
     clear_params=True,
     normalize_sampling=True,
@@ -113,8 +127,10 @@ def run_model(
 
     input_dim = T + id_dim + grads.shape[1] + T + 1
     encoder = Encoder(input_dim=input_dim, hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM).to(device)
+    classifier = Classifier(latent_dim=LATENT_DIM, hidden_dim=HIDDEN_DIM_CLASSIFIER, num_structures=NUM_STRUCTURES).to(device)
     pyro.module("encoder", encoder)
-
+    pyro.module("classifier", classifier)
+    
     def model(id_b, grad_b, vecs_b, counts_b, cos_b):
         with pyro.poutine.scale(scale=LOSS_SCALE):
             B = counts_b.size(0)
@@ -135,6 +151,7 @@ def run_model(
                 dist.HalfNormal(0.5*torch.ones(S, D, device=device)).to_event(2)
             )
 
+            struct_scale_tril = struct_L * struct_scales.unsqueeze(-1)
             struct_comp_logits = pyro.param("struct_comp_logits",
                                             0.01*torch.randn(S, Tloc, device=device))
             theta_a = pyro.param('theta_a', torch.zeros(1, device=device))
@@ -142,13 +159,25 @@ def run_model(
 
             with pyro.plate("cells", B):
                 phi = pyro.sample("phi", dist.Dirichlet(torch.ones(S, device=device)))
-                mu_loc = pyro.sample(
-                    "mu_loc",
-                    dist.Laplace(torch.zeros(D, device=device),
-                                 STRUCT_LOC_PRIOR_SCALE*torch.ones(D, device=device)).to_event(1)
-                )
-                comp_probs = safe_softmax(struct_comp_logits, dim=-1)    # (S,T)
-                mix_probs  = phi @ comp_probs                             # (T,)
+                # mu_loc = pyro.sample(
+                #     "mu_loc",
+                #     dist.Laplace(torch.zeros(D, device=device),
+                #                  STRUCT_LOC_PRIOR_SCALE*torch.ones(D, device=device)).to_event(1)
+                # )
+
+                s  = pyro.sample("structure",
+                                 dist.Categorical(torch.ones(B, S, device=device)),
+                                 infer={"enumerate":"parallel"})
+                μ_s = struct_loc[s]
+                σ_s = struct_scale_tril[s]
+                loc_s  = Vindex(struct_loc)[s, :]            # (..., D)
+                tril_s = Vindex(struct_scale_tril)[s, :, :]                
+                z   = pyro.sample("mu_loc",
+                                  dist.MultivariateNormal(μ_s, scale_tril=σ_s))
+                # logw = gaussian_log_overlap_full(z, torch.zeros_like(z), struct_loc, struct_scale_tril)
+                # phi  = torch.softmax(logw, -1)
+                comp_probs = safe_softmax(struct_comp_logits, dim=-1)
+                mix_probs  = phi @ comp_probs
                 tot = counts_b.sum(-1, keepdim=True).clamp_min(1.0)
                 if OBS_FAMILY == "nb":
                     theta = F.softplus(theta_b + theta_a*vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)) + 1e-6
@@ -166,7 +195,7 @@ def run_model(
         with pyro.poutine.scale(scale=LOSS_SCALE):
             B = counts_b.size(0)
             D, S, Tloc = LATENT_DIM, NUM_STRUCTURES, counts_b.size(1)
-            struct_loc_param = pyro.param("struct_loc_param", torch.randn(S, D, device=device))
+            struct_loc_param = pyro.param("struct_loc_param", 0.1*torch.randn(S, D, device=device))
             pyro.sample("struct_loc", dist.Delta(struct_loc_param).to_event(2))
 
             struct_L_param = pyro.param("struct_L_param",
@@ -186,21 +215,23 @@ def run_model(
             var_q = sd_q**2
 
             # scale_tril = torch.matmul(torch.diag_embed(struct_scales_param), struct_L_param)  # (S,D,D)
-            scale_tril = struct_L_param * struct_scales.unsqueeze(-1)
-            logw = gaussian_log_overlap_full(mu_q, var_q, struct_loc_param, scale_tril)       # (B,S)
-            phi = safe_softmax(logw, dim=-1)
             with pyro.plate("cells", B):
+                z = pyro.sample("mu_loc", dist.Delta(mu_q).to_event(1))
+                scale_tril = struct_L_param * struct_scales.unsqueeze(-1)
+                logw = gaussian_log_overlap_full(mu_q, var_q, struct_loc_param, scale_tril)       # (B,S)
+                phi = safe_softmax(logw, dim=-1)
                 pyro.sample("phi", dist.Delta(phi).to_event(1))
-                print(mu_q.shape)
-                pyro.sample("mu_loc", dist.Delta(mu_q).to_event(1))
-
+                logits_s  = classifier(mu_q)  
+                pyro.sample("structure",
+                            dist.Categorical(logits=logits_s),
+                            infer={"enumerate":"parallel"})
 
     if clear_params:
         pyro.clear_param_store()
 
     losses = []
     for lr in lr_steps:
-        svi = SVI(model, guide, Adam({"lr": lr}), loss=JitTrace_ELBO(num_particles=num_particles))
+        svi = SVI(model, guide, Adam({"lr": lr}), loss=TraceEnum_ELBO(num_particles=num_particles))
         for _ in tqdm.tqdm(range(num_epochs), desc=f"lr={lr}"):
             for id_b_, grad_b, vecs_b, counts_b, cos_b in loader:
                 loss = svi.step(id_b_, grad_b, vecs_b, counts_b, cos_b)

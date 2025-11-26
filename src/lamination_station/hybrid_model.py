@@ -23,11 +23,13 @@ class Encoder(PyroModule):
         super().__init__()
         self.fc1   = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
         self.loc   = nn.Linear(hidden_dim, latent_dim)
         self.scale = nn.Linear(hidden_dim, latent_dim)
     def forward(self, x):
         h = F.relu(self.fc1(x))
         h = F.relu(self.fc2(h))
+        h = F.relu(self.fc3(h))
         μ = self.loc(h)
         σ = F.softplus(self.scale(h)) + 1e-3
         return μ, σ

@@ -1,6 +1,7 @@
 from lamination_station import model
 from lamination_station import identity_model
 from lamination_station import integral_model
+from lamination_station import integral_model_classify
 from lamination_station import single_model
 from lamination_station import hybrid_model
 from lamination_station import plotting as pl
