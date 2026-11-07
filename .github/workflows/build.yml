@@ -2,32 +2,25 @@ name: Build and Test
 
 on:
   pull_request:
-    branches: [ REPLACE_ME ]
   push:
-    branches: [ REPLACE_ME ]
 
 jobs:
   test:
-    name: Build and Test
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+    timeout-minutes: 20
+    env:
+      MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4        
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: 'pip'
-      - name: Set up AllenInstitute Repo Authorization
-        uses: ./.github/actions/setup-ai-github-urls
-        with:
-          token: ${{ secrets.AI_PACKAGES_TOKEN }}
-          ssh_private_key: ${{ secrets.AIBSGITHUB_PRIVATE_KEY }}
-      - name: Run Release
-        run: |
-          make release
-        shell: bash
+          python-version: "3.12"
+          cache: pip
+      - name: Install package and check tools
+        run: python -m pip install -e '.[dev]'
+      - name: Lint
+        run: python -m ruff check src test
+      - name: Type check
+        run: python -m mypy --strict src/lamination_station test
+      - name: Regression tests
+        run: python -c 'import torch; import pytest; raise SystemExit(pytest.main())'

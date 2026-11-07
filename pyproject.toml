@@ -24,13 +24,16 @@ dependencies = [
   "torch",
   "pyro-ppl",
   "networkx",
+  "scipy",
+  "scikit-learn",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest",
   "pytest-cov",
-  "mypy",
+  "mypy==1.18.2",
+  "ruff==0.13.3",
   "black",
   "isort",
 ]
@@ -100,13 +103,7 @@ addopts = [
     "-ra", 
     "--verbose",
     "--ignore=build/private",
-    # Coverage options should be managed in the .coveragerc file.
-    # The below configurations simply enable coverage and reporting.  
-    "--cov", 
-    "--cov-report=term-missing",
-    "--cov-report=html",
-    "--cov-report=xml",
-    "--cov-fail-under=0",
+    # Coverage is opt-in: python -m pytest --cov=lamination_station.
     "--color=yes",
 ] 
 testpaths = [
@@ -124,7 +121,6 @@ exclude = '''(?x)(
     build/
     | build_tools
     | setup.py$
-    | test/
 )'''
 
 cache_dir = "build/.mypy_cache"
@@ -137,11 +133,12 @@ incremental = true
 # https://mypy.readthedocs.io/en/stable/config_file.html#import-discovery
 ignore_missing_imports = true
 follow_imports = "silent"
-no_site_packages = true
+no_site_packages = false
 
 # Untyped definitions and calls
 # https://mypy.readthedocs.io/en/stable/config_file.html#untyped-definitions-and-calls
 check_untyped_defs = true
+strict = true
 
 # Miscellaneous strictness flags
 # https://mypy.readthedocs.io/en/latest/config_file.html#miscellaneous-strictness-flags
@@ -200,3 +197,15 @@ line_length = 99
 profile = "black"
 src_paths = ["src", "test"]
 
+
+# Pyro generates distribution/optimizer wrappers dynamically; its shipped
+# annotations do not describe those APIs. Keep our code and Torch checked.
+[[tool.mypy.overrides]]
+module = ["pyro", "pyro.*"]
+follow_imports = "skip"
+
+[tool.ruff]
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

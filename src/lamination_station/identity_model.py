@@ -1,81 +1,98 @@
+import torch
+from collections.abc import Sequence
+from numpy.typing import NDArray
+from typing import cast
 import pandas as pd
 import numpy as np
 import tqdm
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
-from pyro.nn import PyroModule
-import pyro.infer as infer
-import pyro.optim as optim
-from torch.utils.data import WeightedRandomSampler, DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from pyro.infer import SVI, TraceEnum_ELBO
 from pyro.optim import Adam
+from ._training import prepare_data, make_training_loader, validate_settings
 
-def safe_softmax(x,dim=-1,eps=1e-10):
-    x=torch.softmax(x,dim)
-    x=x+eps
-    return (x/x.sum(dim,keepdim=True))
 
-class Encoder(PyroModule):
-    def __init__(self, input_dim, hidden_dim, latent_dim):
+def safe_softmax(x: torch.Tensor, dim: int = -1, eps: float = 1e-10) -> torch.Tensor:
+    """Normalize probabilities with a strictly positive floor."""
+    x = torch.softmax(x, dim)
+    x = x + eps
+    return x / x.sum(dim, keepdim=True)
+
+
+class Encoder(nn.Module):
+    def __init__(self, *, input_dim: int, hidden_dim: int, latent_dim: int) -> None:
+        """Initialize the network dimensions."""
         super().__init__()
-        self.fc1   = nn.Linear(input_dim, hidden_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.loc   = nn.Linear(hidden_dim, latent_dim)
+        self.loc = nn.Linear(hidden_dim, latent_dim)
         self.scale = nn.Linear(hidden_dim, latent_dim)
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate the network."""
         h = F.relu(self.fc1(x))
         h = F.relu(self.fc2(h))
         μ = self.loc(h)
         σ = F.softplus(self.scale(h)) + 1e-3
         return μ, σ
 
-class Classifier(PyroModule):
-    def __init__(self, latent_dim, hidden_dim, num_structures):
+
+class Classifier(nn.Module):
+    def __init__(self, *, latent_dim: int, hidden_dim: int, num_structures: int) -> None:
+        """Initialize the network dimensions."""
         super().__init__()
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.out = nn.Linear(hidden_dim, num_structures)
-    def forward(self, z):
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Evaluate the network."""
         h = F.relu(self.fc1(z))
         h = F.relu(self.fc2(h))
-        return self.out(h)
+        return cast(torch.Tensor, self.out(h))
 
-class Decoder(PyroModule):
-    def __init__(self, latent_dim, hidden_dim, out_dim):
+
+class Decoder(nn.Module):
+    def __init__(self, *, latent_dim: int, hidden_dim: int, out_dim: int) -> None:
+        """Initialize the network dimensions."""
         super().__init__()
         inp = latent_dim + 1
         self.fc1 = nn.Linear(inp, hidden_dim)
         self.out = nn.Linear(hidden_dim, out_dim)
-    def forward(self, z, mean_dist):
+
+    def forward(self, z: torch.Tensor, mean_dist: torch.Tensor) -> torch.Tensor:
+        """Evaluate the network."""
         x = torch.cat([z, mean_dist], dim=-1)
         h = F.relu(self.fc1(x))
-        return self.out(h)
+        return cast(torch.Tensor, self.out(h))
+
 
 def run_model(
-    df_grads, #output from calculate_comp_grads
-    cell_types_series, #pandas categorical series
-    neighbor_counts,
-    gradients, #output from calculate_comp_grads
-    neighbor_type_vecs,
-    LATENT_DIM     = 2,
-    NUM_STRUCTURES = 25,
-    num_epochs=2000,
-    lr_steps = [1e-3,1e-4,1e-5],
-    batch_size     = 1024,
-    STRUCT_SCALE_SCALE = 0.1, #Strength of regularization on latent space dispersion
-    STRUCT_LOC_PRIOR_SCALE = 1., #Strength of regularization on more structures
-    LOSS_SCALE = 1., #Multiply all ELBO by this factor (can increase stability if too high or too low)
-    HIDDEN_DIM = 512,
-    HIDDEN_DIM_CLASSIFIER = 128,
-    device = 'cpu',
-    clear_params = True,
-    normalize_sampling = True,
-    num_particles = 3,
-    ignore_cur_type = False
-):
+    df_grads: pd.DataFrame,
+    cell_types_series: pd.Series,
+    neighbor_counts: pd.DataFrame,
+    gradients: NDArray[np.float64],
+    neighbor_type_vecs: pd.DataFrame,
+    LATENT_DIM: int = 2,
+    NUM_STRUCTURES: int = 25,
+    num_epochs: int = 2000,
+    lr_steps: Sequence[float] = (0.001, 0.0001, 1e-05),
+    batch_size: int = 1024,
+    STRUCT_SCALE_SCALE: float = 0.1,
+    STRUCT_LOC_PRIOR_SCALE: float = 1.0,
+    LOSS_SCALE: float = 1.0,
+    HIDDEN_DIM: int = 512,
+    HIDDEN_DIM_CLASSIFIER: int = 128,
+    device: str | torch.device = "cpu",
+    clear_params: bool = True,
+    normalize_sampling: bool = True,
+    num_particles: int = 3,
+    ignore_cur_type: bool = False,
+    seed: int | None = None,
+) -> tuple[pd.DataFrame, NDArray[np.float32], NDArray[np.float32], list[float]]:
     """
     Train a Pyro-based variational model to infer latent spatial structures
     from per-cell gradient features and categorical cell identities.
@@ -123,7 +140,7 @@ def run_model(
     clear_params : bool, default=True
         Whether to clear the Pyro parameter store before fitting.
     normalize_sampling : bool, default=True
-        Whether to sample each cell type equally or in the existing proportion.
+        Whether to balance sampling by cell type; importance weights preserve the population objective.
 
     Returns
     -------
@@ -132,7 +149,6 @@ def run_model(
         - `"z1"`, …, `"z{LATENT_DIM}"`: posterior means of latent embeddings,
         - `"structure_pred1"`, `"structure_pred2"`: top-2 inferred structures,
         - `"phi"`: mixture weight for the top structure,
-        - `"structure_pred_nearest"`: assignment by nearest structure center.
     logits_s : numpy.ndarray, shape (N, NUM_STRUCTURES)
         Raw classifier logits for each cell over all structures.
     struct_comp_probs : numpy.ndarray, shape (NUM_STRUCTURES, T)
@@ -141,229 +157,225 @@ def run_model(
 
     """
 
-    # ──────────────── Prepare Data & One-Hot IDs ────────────────
-    # comp_vectors, gradients, neighbor_type_vecs (DataFrame),
-    # neighbor_counts (DataFrame), and df already in scope.
-    
-    counts = torch.tensor(neighbor_counts.values, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
-    comp = counts / counts.sum(-1,keepdims=True)
-    grads = torch.tensor(gradients, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
-    
-    # reshape neighbor_type_vecs → (N, T, 2)
-    N, twoT = neighbor_type_vecs.shape
-    T       = counts.shape[1]
-    vecs_np = neighbor_type_vecs.values.reshape(N, T, 2)
-    type_vecs = torch.tensor(vecs_np, dtype=torch.float, device=device,requires_grad=False).nan_to_num(0.)
-    
-    # precompute cosine between grad & type vectors
-    grad_type_cos = F.cosine_similarity(
-        grads.unsqueeze(1),
-        type_vecs,
-        dim=-1
-    ).to(device)
-    
-    
-    # one-hot cell identity
-    cell_types   = cell_types_series.values
-    unique_types = cell_types_series.cat.categories
-    id_dim       = len(unique_types)
-    id_arr       = np.zeros((N, id_dim), dtype=float)
-    type_to_ix   = {t:i for i,t in enumerate(unique_types)}
-    for i,t in enumerate(cell_types):
-        id_arr[i, type_to_ix[t]] = 1. if not ignore_cur_type else 0.
-    id_b = torch.tensor(id_arr, dtype=torch.float, device=device,requires_grad=False)
-    # ──────────────── DataLoader ────────────────
-    # dataset = TensorDataset(id_b, grads, type_vecs, counts, grad_type_cos)
-    # loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-    
-    labels       = np.array([type_to_ix[t] for t in cell_types])  # shape (N,)
-    class_counts = np.bincount(labels)+200                  #Add 200 so super rare don't get way oversampled
-    # weight for sample i = 1 / count_of_class(labels[i])
-    sample_weights = 1.0 / class_counts[labels] if normalize_sampling else  class_counts[labels]/class_counts[labels]
-    sample_weights = torch.from_numpy(sample_weights).double().to(device)
-    
-    # 3) make a WeightedRandomSampler
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,   # a Tensor of length N
-        num_samples=len(sample_weights),  
-        replacement=True          # allow resampling the same index in an epoch
-    )
-    
-    # 4) DataLoader with sampler instead of shuffle
-    dataset = TensorDataset(id_b, grads, type_vecs, counts, grad_type_cos)
-    loader  = DataLoader(
-        dataset,
+    validate_settings(
+        num_structures=NUM_STRUCTURES,
+        latent_dim=LATENT_DIM,
         batch_size=batch_size,
-        sampler=sampler,
-        drop_last=True
+        num_epochs=num_epochs,
+        lr_steps=lr_steps,
+        num_particles=num_particles,
+        loss_scale=LOSS_SCALE,
+        location_scale=STRUCT_LOC_PRIOR_SCALE,
+        hidden_dim=HIDDEN_DIM,
     )
-    
-    
-    # ──────────────── Build & Register Modules ────────────────
-    input_dim = T + id_dim + 2 + 1
+    data = prepare_data(
+        df=df_grads,
+        cell_types=cell_types_series,
+        counts=neighbor_counts,
+        gradients=gradients,
+        type_vectors=neighbor_type_vecs,
+        device=device,
+        ignore_identity=False,
+    )
+    counts, grads, type_vecs = data.counts, data.gradients, data.type_vectors
+    id_b, grad_type_cos = data.identities, data.cosines
+    N, T = counts.shape
+    id_b.shape[1]
+    loader = make_training_loader(
+        data=data,
+        cell_types=cell_types_series,
+        batch_size=batch_size,
+        normalize_sampling=normalize_sampling,
+    )
     if clear_params:
         pyro.clear_param_store()
-    encoder    = Encoder(input_dim=input_dim, hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM).to(device)
-    classifier = Classifier(latent_dim=LATENT_DIM, hidden_dim=HIDDEN_DIM_CLASSIFIER, num_structures=NUM_STRUCTURES).to(device)
-    decoder    = Decoder(latent_dim=LATENT_DIM,
-                         hidden_dim=HIDDEN_DIM, out_dim=T).to(device)
-    
-    pyro.module("encoder",    encoder)
-    pyro.module("classifier", classifier)
-    pyro.module("decoder",    decoder)
-    
-    def unified_model(id_b, grad_b, vecs_b, counts_b, cos_b):
-        '''gpgmm style NB'''
+    if seed is not None:
+        pyro.set_rng_seed(seed)
+    input_dim = 2 * T + grads.shape[1] + 1
+    if not np.isfinite(STRUCT_SCALE_SCALE) or STRUCT_SCALE_SCALE <= 0:
+        raise ValueError("STRUCT_SCALE_SCALE must be finite and positive")
+    encoder = Encoder(input_dim=input_dim, hidden_dim=HIDDEN_DIM, latent_dim=LATENT_DIM).to(device)
+    classifier = Classifier(
+        latent_dim=LATENT_DIM, hidden_dim=HIDDEN_DIM_CLASSIFIER, num_structures=NUM_STRUCTURES
+    ).to(device)
+    decoder = Decoder(latent_dim=LATENT_DIM, hidden_dim=HIDDEN_DIM, out_dim=T).to(device)
+
+    def unified_model(
+        id_b: torch.Tensor,
+        grad_b: torch.Tensor,
+        vecs_b: torch.Tensor,
+        counts_b: torch.Tensor,
+        cos_b: torch.Tensor,
+        inverse_prob_b: torch.Tensor,
+    ) -> None:
+        """gpgmm style NB"""
         with pyro.poutine.scale(scale=LOSS_SCALE):
-            comp_b = (counts_b / counts_b.sum(-1,keepdims=True)).detach()
+            comp_b = (counts_b / counts_b.sum(-1, keepdim=True)).detach()
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
-        
-            # 1) struct_loc & struct_scale as before
-            struct_loc   = pyro.param("struct_loc",   0.1*torch.randn(S, D, device=device))
-            struct_loc = pyro.sample("struct_loc_sample",
-                                       dist.Laplace(torch.zeros(S, D, device=device),STRUCT_LOC_PRIOR_SCALE*torch.ones(S, D, device=device))
-                                           .to_event(2))
-            struct_scale = pyro.sample("struct_scale_sample",
-                                       dist.HalfCauchy(STRUCT_SCALE_SCALE*torch.ones(S, D, device=device))
-                                           .to_event(2))
-            struct_comp  = pyro.param("struct_comp", 0.1*torch.randn(S, T, device=device))
-            theta_a = pyro.param('theta_a',torch.zeros(1,device=device))
-            theta_b = pyro.param('theta_b',100*torch.ones((1,T),device=device))
-            
-            with pyro.plate("cells", B):
-                s  = pyro.sample("structure",
-                                 dist.Categorical(torch.ones(B, S, device=device)),
-                                 infer={"enumerate":"parallel"})
 
-                phi = pyro.sample("phi",
-                    dist.Dirichlet(torch.ones(B, S, device=device)))
-        
+            # 1) struct_loc & struct_scale as before
+            struct_loc = pyro.param("struct_loc", 0.1 * torch.randn(S, D, device=device))
+            struct_loc = pyro.sample(
+                "struct_loc_sample",
+                dist.Laplace(
+                    torch.zeros(S, D, device=device),
+                    STRUCT_LOC_PRIOR_SCALE * torch.ones(S, D, device=device),
+                ).to_event(2),
+            )
+            struct_scale = pyro.sample(
+                "struct_scale_sample",
+                dist.HalfCauchy(STRUCT_SCALE_SCALE * torch.ones(S, D, device=device)).to_event(2),
+            )
+            struct_comp = pyro.param("struct_comp", 0.1 * torch.randn(S, T, device=device))
+            theta_a = pyro.param("theta_a", torch.zeros(1, device=device))
+            theta_b = pyro.param("theta_b", 100 * torch.ones((1, T), device=device))
+
+            with pyro.plate("cells", B), pyro.poutine.scale(scale=inverse_prob_b / B):
+                pyro.sample(
+                    "structure",
+                    dist.Categorical(torch.ones(B, S, device=device)),
+                    infer={"enumerate": "parallel"},
+                )
+
+                phi = pyro.sample("phi", dist.Dirichlet(torch.ones(B, S, device=device)))
+
                 # 2) pick top-2 probs and their indices
                 top2_p, top2_idx = phi.topk(2, dim=1)  # both shape (B, 2)
-        
+
                 # 3) normalize to mixture weights
                 mix_w = top2_p / top2_p.sum(dim=1, keepdim=True)  # (B, 2)
 
-                μ_s = (struct_loc[top2_idx] * mix_w.unsqueeze(-1)).sum(1) #struct_loc[s]
-                σ_s = (struct_scale[top2_idx]**2 * mix_w.unsqueeze(-1)).sum(1)**0.5
-                z   = pyro.sample("z",
-                                  dist.Normal(μ_s, σ_s+1e-6).to_event(1))
-        
+                μ_s = (struct_loc[top2_idx] * mix_w.unsqueeze(-1)).sum(1)  # struct_loc[s]
+                σ_s = (struct_scale[top2_idx] ** 2 * mix_w.unsqueeze(-1)).sum(1) ** 0.5
+                z = pyro.sample("z", dist.Normal(μ_s, σ_s + 1e-6).to_event(1))
+
                 mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
-                rate      = decoder(z, mean_dist)
-                theta = F.softplus(theta_b + theta_a*(mean_dist)) + 1e-6
+                pyro.module("decoder", decoder, update_module_params=True)
+                rate = decoder(z, mean_dist)
+                F.softplus(theta_b + theta_a * (mean_dist)) + 1e-6
                 # print(rate.argmax(1))
                 out_dist = dist.OneHotCategorical(logits=rate)
-                pyro.sample("obs",
-                            out_dist,
-                            obs=id_b)
-                
+                pyro.sample("obs", out_dist, obs=id_b)
+
                 # 4) gather the corresponding struct_comp logits → (B, 2, T)
                 comp_logits = (struct_comp[top2_idx] * mix_w.unsqueeze(-1)).sum(1)
                 # print(id_b.argmax(1))
                 # print(comp_logits.argmax(1))
                 out_dist2 = dist.OneHotCategorical(logits=comp_logits)
-                pyro.sample("obs_2",
-                            out_dist2,
-                            obs=id_b)
-    
-    
-    def guide(id_b, grad_b, vecs_b, counts_b, cos_b): 
+                pyro.sample("obs_2", out_dist2, obs=id_b)
+
+    def guide(
+        id_b: torch.Tensor,
+        grad_b: torch.Tensor,
+        vecs_b: torch.Tensor,
+        counts_b: torch.Tensor,
+        cos_b: torch.Tensor,
+        inverse_prob_b: torch.Tensor,
+    ) -> None:
+        """Construct the variational guide with correctly weighted local terms."""
         with pyro.poutine.scale(scale=LOSS_SCALE):
-            comp_b = counts_b / counts_b.sum(-1,keepdims=True)
+            comp_b = counts_b / counts_b.sum(-1, keepdim=True)
             B, T = comp_b.shape
             S, D = NUM_STRUCTURES, LATENT_DIM
-            struct_loc   = pyro.param("struct_loc",   0.1*torch.randn(S, D, device=device))
-            struct_loc = pyro.sample("struct_loc_sample",
-                                       dist.Delta(struct_loc)
-                                           .to_event(2))
-            struct_scale_param = pyro.param("struct_scale",
-                                            torch.ones(S, D, device=device),
-                                            constraint=dist.constraints.positive)
-            pyro.sample("struct_scale_sample",
-                        dist.Delta(struct_scale_param).to_event(2))
-        
-            with pyro.plate("cells", B):
+            struct_loc = pyro.param("struct_loc", 0.1 * torch.randn(S, D, device=device))
+            struct_loc = pyro.sample("struct_loc_sample", dist.Delta(struct_loc).to_event(2))
+            struct_scale_param = pyro.param(
+                "struct_scale",
+                torch.ones(S, D, device=device),
+                constraint=dist.constraints.positive,
+            )
+            pyro.sample("struct_scale_sample", dist.Delta(struct_scale_param).to_event(2))
+
+            with pyro.plate("cells", B), pyro.poutine.scale(scale=inverse_prob_b / B):
                 mean_dist = vecs_b.norm(dim=-1).mean(dim=-1, keepdim=True)
-                x_enc     = torch.cat([comp_b, grad_b, cos_b, mean_dist], dim=-1)
-                μ_z, σ_z  = encoder(x_enc)
-                z = pyro.sample("z", dist.Normal(μ_z, σ_z+1e-6).to_event(1))
-        
-                logits_s  = classifier(z)  
+                x_enc = torch.cat([comp_b, grad_b, cos_b, mean_dist], dim=-1)
+                pyro.module("encoder", encoder, update_module_params=True)
+                μ_z, σ_z = encoder(x_enc)
+                z = pyro.sample("z", dist.Normal(μ_z, σ_z + 1e-6).to_event(1))
+
+                pyro.module("classifier", classifier, update_module_params=True)
+                logits_s = classifier(z)
                 phi_q = safe_softmax(logits_s, dim=-1)
-                phi_q = phi_q+1e-6
-                phi_q = (phi_q/phi_q.sum(-1)[...,None]).squeeze()
-                pyro.sample("phi",
-                    dist.Delta(phi_q).to_event(1))
-                pyro.sample("structure",
-                            dist.Categorical(logits=logits_s),
-                            infer={"enumerate":"parallel"})
-    
-    
-    if clear_params:
-        pyro.clear_param_store()
+                phi_q = phi_q + 1e-6
+                phi_q = phi_q / phi_q.sum(-1)[..., None]
+                pyro.sample("phi", dist.Delta(phi_q).to_event(1))
+                pyro.sample(
+                    "structure", dist.Categorical(logits=logits_s), infer={"enumerate": "parallel"}
+                )
+
     losses = []
 
     for lr_step in lr_steps:
         optimizer = Adam({"lr": lr_step})
-        svi       = SVI(unified_model, guide, optimizer, loss=TraceEnum_ELBO(num_particles=num_particles))
-        
-        for epoch in tqdm.tqdm(range(1, num_epochs+1), desc=f"Epoch"):
+        svi = SVI(
+            unified_model, guide, optimizer, loss=TraceEnum_ELBO(num_particles=num_particles)
+        )
+
+        for epoch in tqdm.tqdm(range(1, num_epochs + 1), desc="Epoch"):
             total_loss = 0.0
-            for id_b_, grad_b, vecs_b, counts_b, cos_b in loader:
+            for id_b_, grad_b, vecs_b, counts_b, cos_b, inverse_prob_b in loader:
                 # move each batch to device (they’re already on device, but safe):
-                id_b_    = id_b_.to(device)
-                grad_b   = grad_b.to(device)
-                vecs_b   = vecs_b.to(device)
+                id_b_ = id_b_.to(device)
+                grad_b = grad_b.to(device)
+                vecs_b = vecs_b.to(device)
                 counts_b = counts_b.to(device)
-                cos_b    = cos_b.to(device)
-                loss = svi.step(id_b_, grad_b, vecs_b, counts_b, cos_b)
+                cos_b = cos_b.to(device)
+                loss = svi.step(id_b_, grad_b, vecs_b, counts_b, cos_b, inverse_prob_b)
                 total_loss += loss
                 losses.append(loss)
-        
-            if epoch % 100 ==0:
+
+            if epoch % 100 == 0:
                 avg_loss = total_loss / len(loader)
                 print(f"[Epoch {epoch:02d}] avg ELBO loss: {avg_loss:.2f}")
-    
-    encoder.eval(); classifier.eval()
+
+    encoder.eval()
+    classifier.eval()
     with torch.no_grad():
         N = counts.size(0)
         mean_dist_full = type_vecs.norm(dim=-1).mean(dim=-1, keepdim=True)
 
-        z_pred_np      = np.zeros((N, LATENT_DIM), dtype=np.float32)
-        logits_s_np    = np.zeros((N, NUM_STRUCTURES), dtype=np.float32)
-        pred1_np       = np.zeros(N, dtype=np.int64)
-        pred2_np       = np.zeros(N, dtype=np.int64)
-        phi_np         = np.zeros(N, dtype=np.float32)
+        z_pred_np = np.zeros((N, LATENT_DIM), dtype=np.float32)
+        logits_s_np = np.zeros((N, NUM_STRUCTURES), dtype=np.float32)
+        pred1_np = np.zeros(N, dtype=np.int64)
+        pred2_np = np.zeros(N, dtype=np.int64)
+        phi_np = np.zeros(N, dtype=np.float32)
 
-        idx_all   = torch.arange(N)
-        infer_set = TensorDataset(idx_all, id_b, grads, type_vecs, counts, grad_type_cos, mean_dist_full)
+        idx_all = torch.arange(N)
+        infer_set = TensorDataset(
+            idx_all, id_b, grads, type_vecs, counts, grad_type_cos, mean_dist_full
+        )
         infer_loader = DataLoader(infer_set, batch_size=batch_size, shuffle=False, drop_last=False)
 
         for idx_b, id_b_, grad_b, vecs_b, counts_b, cos_b, md_b in infer_loader:
-            comp_b = (counts_b / counts_b.sum(-1, keepdims=True)).nan_to_num(0.)
-            X_b    = torch.cat([comp_b, grad_b, cos_b, md_b], dim=1).to(device)
+            comp_b = (counts_b / counts_b.sum(-1, keepdim=True)).nan_to_num(0.0)
+            X_b = torch.cat([comp_b, grad_b, cos_b, md_b], dim=1).to(device)
 
+            pyro.module("encoder", encoder, update_module_params=True)
             loc_b, _ = encoder(X_b)
-            z_b      = loc_b
+            z_b = loc_b
+            pyro.module("classifier", classifier, update_module_params=True)
             logits_b = classifier(z_b)
-            probs_b  = torch.softmax(logits_b, dim=1)
+            probs_b = torch.softmax(logits_b, dim=1)
             top2_p_b, top2_idx_b = probs_b.topk(2, dim=1)
 
             i = idx_b.cpu().numpy()
-            z_pred_np[i]   = z_b.cpu().numpy()
+            z_pred_np[i] = z_b.cpu().numpy()
             logits_s_np[i] = logits_b.cpu().numpy()
-            pred1_np[i]    = top2_idx_b[:, 0].cpu().numpy()
-            pred2_np[i]    = top2_idx_b[:, 1].cpu().numpy()
-            phi_np[i]      = (top2_p_b[:, 0] / top2_p_b.sum(dim=1)).cpu().numpy()
-
+            pred1_np[i] = top2_idx_b[:, 0].cpu().numpy()
+            pred2_np[i] = top2_idx_b[:, 1].cpu().numpy()
+            phi_np[i] = (top2_p_b[:, 0] / top2_p_b.sum(dim=1)).cpu().numpy()
 
     out = df_grads.copy()
     for d in range(LATENT_DIM):
-        out[f"z{d+1}"] = z_pred_np[:, d]
-    out["structure_pred1"]        = pd.Categorical(pred1_np)
-    out["structure_pred2"]        = pd.Categorical(pred2_np)
-    out["phi"]                    = phi_np
+        out[f"z{d + 1}"] = z_pred_np[:, d]
+    out["structure_pred1"] = pd.Categorical(pred1_np)
+    out["structure_pred2"] = pd.Categorical(pred2_np)
+    out["phi"] = phi_np
 
-    return out, logits_s_np, torch.softmax(pyro.param('struct_comp').cpu().detach(), -1).numpy(), losses
+    return (
+        out,
+        logits_s_np,
+        torch.softmax(pyro.param("struct_comp").cpu().detach(), -1).numpy(),
+        losses,
+    )

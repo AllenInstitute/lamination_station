@@ -1,13 +1,17 @@
+import torch  # noqa: F401
+from collections.abc import Sequence
+from typing import Any
+from numpy.typing import NDArray
 import networkx as nx
 import seaborn
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
 from pandas.api.types import is_numeric_dtype
 
-def clip_latent_dimensions(matrix, x):
+
+def clip_latent_dimensions(matrix: NDArray[np.float64], x: float) -> NDArray[np.float64]:
     """
     Clips each latent dimension of the matrix at the 0+x and 100-x percentile.
 
@@ -29,24 +33,28 @@ def clip_latent_dimensions(matrix, x):
     for col_idx in range(matrix.shape[1]):
         # Calculate the percentiles for the current column
         lower_percentile = np.percentile(matrix[:, col_idx], x)
-        upper_percentile = np.percentile(matrix[:, col_idx], 100-x)
-        
+        upper_percentile = np.percentile(matrix[:, col_idx], 100 - x)
+
         # Clip the values in the current column based on the calculated percentiles
-        clipped_matrix[:, col_idx] = np.clip(matrix[:, col_idx], lower_percentile, upper_percentile)
+        clipped_matrix[:, col_idx] = np.clip(
+            matrix[:, col_idx], lower_percentile, upper_percentile
+        )
 
     return clipped_matrix
 
 
-def plot_cells_on_structure_graph(out,
-                                  G,
-                                  jitter=0.05,
-                                  cell_size=20,
-                                  cell_alpha=0.6,
-                                  color_col='Group',
-                                  figsize=(8,8),
-                                  spring_k=None,
-                                  edge_scale=5.0,
-                                  seed=0):
+def plot_cells_on_structure_graph(
+    out: pd.DataFrame,
+    G: nx.Graph,
+    jitter: float = 0.05,
+    cell_size: float = 20,
+    cell_alpha: float = 0.6,
+    color_col: str = "Group",
+    figsize: tuple[float, float] = (8, 8),
+    spring_k: float | None = None,
+    edge_scale: float = 5.0,
+    seed: int = 0,
+) -> tuple[Any, Any]:
     """
     Plots a force-directed layout of the subset of structures
     that occur in out[['structure_pred1','structure_pred2']],
@@ -84,7 +92,7 @@ def plot_cells_on_structure_graph(out,
         The scatter artist (PathCollection) and the Axes.
     """
     # 1) Induce subgraph on only used structure-nodes
-    used = set(out['structure_pred1']).union(out['structure_pred2'])
+    used = set(out["structure_pred1"]).union(out["structure_pred2"])
     G_sub = G.subgraph(used).copy()
 
     # 2) Compute a force-directed (spring) layout
@@ -94,41 +102,37 @@ def plot_cells_on_structure_graph(out,
 
     # 3) Draw edges individually, scaled by weight
     for u, v, data in G_sub.edges(data=True):
-        w = data.get('weight', 1.0)
+        w = data.get("weight", 1.0)
         x1, y1 = pos[u]
         x2, y2 = pos[v]
-        ax.plot([x1, x2], [y1, y2],
-                color='gray',
-                linewidth=w * edge_scale,
-                alpha=w)
+        ax.plot([x1, x2], [y1, y2], color="gray", linewidth=w * edge_scale, alpha=w)
 
     # 4) Draw nodes & labels
-    nx.draw_networkx_nodes(G_sub, pos, ax=ax,
-                           node_color='lightblue',
-                           node_size=300)
+    nx.draw_networkx_nodes(G_sub, pos, ax=ax, node_color="lightblue", node_size=300)
     nx.draw_networkx_labels(G_sub, pos, ax=ax)
 
     # 5) Compute each cell's (x,y) along its top-2 edge
-    coords1 = np.array([pos[n] for n in out['structure_pred1']])
-    coords2 = np.array([pos[n] for n in out['structure_pred2']])
-    phi     = out['phi'].values[:, None]
-    pts     = phi * coords1 + (1 - phi) * coords2
+    coords1 = np.array([pos[n] for n in out["structure_pred1"]])
+    coords2 = np.array([pos[n] for n in out["structure_pred2"]])
+    phi = out["phi"].values[:, None]
+    pts = phi * coords1 + (1 - phi) * coords2
 
     # 6) Add jitter
-    pts += np.random.randn(*pts.shape) * jitter
+    pts += np.random.default_rng(seed).normal(size=pts.shape) * jitter
 
     # 7) Scatter, coloring by `color_col` (categorical vs. numeric)
     cell_df = out.copy()
-    cell_df['x_graph'], cell_df['y_graph'] = pts[:,0], pts[:,1]
+    cell_df["x_graph"], cell_df["y_graph"] = pts[:, 0], pts[:, 1]
 
     if is_numeric_dtype(cell_df[color_col]):
         # continuous numeric → use a colormap + colorbar
         sc = ax.scatter(
-            cell_df['x_graph'], cell_df['y_graph'],
+            cell_df["x_graph"],
+            cell_df["y_graph"],
             c=cell_df[color_col],
-            cmap='viridis',
+            cmap="viridis",
             s=cell_size,
-            alpha=cell_alpha
+            alpha=cell_alpha,
         )
         cbar = fig.colorbar(sc, ax=ax)
         cbar.set_label(color_col)
@@ -138,69 +142,86 @@ def plot_cells_on_structure_graph(out,
         scatter = seaborn.scatterplot(
             ax=ax,
             data=cell_df,
-            x='x_graph',
-            y='y_graph',
+            x="x_graph",
+            y="y_graph",
             hue=color_col,
             s=cell_size,
             alpha=cell_alpha,
-            palette='tab20',
-            legend='full'
+            palette="tab20",
+            legend="full",
         )
-        plt.legend(bbox_to_anchor=(1.05,1), loc="upper left")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
 
     ax.set_axis_off()
     plt.tight_layout()
     return scatter, ax
 
-def plot_loss(loss_tracker):
-    '''Plots vector of values along with moving average'''
-    seaborn.scatterplot(x=list(range(len(loss_tracker))),y=loss_tracker,alpha=0.5,s=2)
-    w=300
-    mvavg=moving_average(np.pad(loss_tracker,int(w/2),mode='edge'),w)
-    seaborn.lineplot(x=list(range(len(mvavg))),y=mvavg,color='coral')
+
+def plot_loss(loss_tracker: Sequence[float]) -> None:
+    """Plots vector of values along with moving average"""
+    seaborn.scatterplot(x=list(range(len(loss_tracker))), y=loss_tracker, alpha=0.5, s=2)
+    if len(loss_tracker) == 0:
+        raise ValueError("loss_tracker must not be empty")
+    w = min(300, len(loss_tracker))
+    mvavg = moving_average(np.pad(loss_tracker, (w // 2, (w - 1) // 2), mode="edge"), w)
+    seaborn.lineplot(x=list(range(len(mvavg))), y=mvavg, color="coral")
     plt.show()
 
-def moving_average(x, w):
-    return np.convolve(x, np.ones(w), 'valid') / w
 
-def plot_gradient_arrows(df_grads,gradients,taxon,x_col,y_col,xlim=None,ylim=None,scale=2.):
+def moving_average(x: NDArray[np.float64], w: int) -> NDArray[np.float64]:
+    """Compute a moving average using a positive window length."""
+    if w < 1 or w > len(x):
+        raise ValueError("w must be between 1 and len(x)")
+    return np.convolve(x, np.ones(w), "valid") / w
+
+
+def plot_gradient_arrows(
+    df_grads: pd.DataFrame,
+    gradients: NDArray[np.float64],
+    taxon: str,
+    x_col: str,
+    y_col: str,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+    scale: float = 2.0,
+) -> None:
+    """Plot gradient descriptors in the original physical coordinate units."""
     mask = np.array([True for x in df_grads.index])
     x = df_grads.loc[mask, x_col]
     y = df_grads.loc[mask, y_col]
-    
+
     # 3) compute alphas from your gradient_norm
-    norms = df_grads['gradient_norm']
-    alphas = norms / norms.max()
+    norms = df_grads["gradient_norm"]
+    alphas = norms / norms.max() if norms.max() > 0 else norms * 0
     alphas = np.nan_to_num(alphas)
     # 4) build your color mapping off of df_grads
     unique_types = df_grads.loc[mask, taxon].unique()
-    cmap = list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102) + list(sc.pl.palettes.godsnot_102)
+    cmap = (
+        list(sc.pl.palettes.godsnot_102)
+        + list(sc.pl.palettes.godsnot_102)
+        + list(sc.pl.palettes.godsnot_102)
+        + list(sc.pl.palettes.godsnot_102)
+    )
     color_map = {ctype: cmap[i] for i, ctype in enumerate(unique_types)}
     colors = df_grads.loc[mask, taxon].map(color_map)
-    
+
     # 5) now plot
-    plt.figure(figsize=(6,6))
-    plt.scatter(x, y,
-                c=colors,
-                s=0.1,
-                rasterized=True)
-    
+    plt.figure(figsize=(6, 6))
+    plt.scatter(x, y, c=colors, s=0.1, rasterized=True)
+
     # use the returned `gradients` array directly
-    gx = gradients[mask, 0]
-    gy = gradients[mask, 1]
-    
-    plt.quiver(x, y,
-               gx, gy,
-               color=colors,
-               alpha=alphas,
-               angles='xy',
-               scale_units='xy',
-               scale=scale)
+    coordinate_scale = np.asarray(
+        df_grads.attrs.get("lamination_station_coordinate_scale", [1.0, 1.0])
+    )
+    gx = gradients[mask, 0] * coordinate_scale[0]
+    gy = gradients[mask, 1] * coordinate_scale[1]
+
+    plt.quiver(
+        x, y, gx, gy, color=colors, alpha=alphas, angles="xy", scale_units="xy", scale=scale
+    )
     if xlim is not None:
         plt.xlim(xlim)
-    if xlim is not None:
+    if ylim is not None:
         plt.ylim(ylim)
     plt.xlabel(x_col)
     plt.ylabel(y_col)
-
-

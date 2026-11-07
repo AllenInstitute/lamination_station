@@ -1,3 +1,4 @@
+import torch  # noqa: F401
 from lamination_station import model
 from lamination_station import identity_model
 from lamination_station import integral_model
@@ -7,3 +8,21 @@ from lamination_station import hybrid_model
 from lamination_station import plotting as pl
 from lamination_station import preprocessing as pp
 from lamination_station import post as po
+from lamination_station import integral_model_notmvn
+from lamination_station import composition
+from lamination_station import spatial_graph
+
+__all__ = [
+    "model",
+    "identity_model",
+    "integral_model",
+    "integral_model_classify",
+    "single_model",
+    "hybrid_model",
+    "integral_model_notmvn",
+    "composition",
+    "spatial_graph",
+    "pl",
+    "pp",
+    "po",
+]
