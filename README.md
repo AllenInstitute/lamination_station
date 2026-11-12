@@ -1,6 +1,6 @@
 # Lamination Station
 
-A Bayesian modeling toolkit for identifying spatial structures from cell coordinates and categorical cell-type labels. The experimental model variants use PyTorch and Pyro.
+A toolkit for calling regions from spatial cell coordinates and categorical cell-type labels. The recommended analysis workflow is the **gradient-ring composition mixture**; the original neural variants remain available as experimental models.
 
 Install with Python **3.12 or newer**:
 
@@ -8,7 +8,73 @@ Install with Python **3.12 or newer**:
 python -m pip install -e .
 ```
 
-The original [spinal cord](examples/spc_laminae_example.ipynb) and [cortex](examples/v1_example.ipynb) notebooks illustrate the method, but contain machine-specific data paths and historical postprocessing code. Use the package functions for the corrected behavior below; `structure_pred_nearest` is no longer an output.
+## Recommended region-calling workflow
+
+```python
+import torch
+import lamination_station as ls
+
+# One row per input cell, with a unique cell ID as the dataframe index.
+# Use physical coordinates and nonempty string cell-type labels.
+prepared = ls.regions.prepare_gradient_rings(
+    cells=df, x_col="x", y_col="y", celltype_col="cell_type",
+    sample_col="section",  # explicitly use None for a single coordinate frame
+    # piece_col="piece",   # isolate separately identified pieces within a section
+)
+result = ls.regions.fit_regions(features=prepared, n_regions=16, seed=17)
+called_cells = df.join(result.assignments.add_prefix("ls_"))
+print(result.region_summary)
+print(result.model.converged)
+result.save("/results/regions_16")  # creates a new directory; never overwrites one
+```
+
+**Resolution is `n_regions`.** Eight regions reproduces the benchmark's default capacity; use a larger count, such as 12 or 16, to overcluster for subsequent review. The model may leave components without hard assignments, so inspect the requested versus occupied count and small-region support. Region IDs are arbitrary component labels, not anatomical lamina names.
+
+By default, neighborhoods use gradient-adjusted ranks **1–15, 16–30, and 31–60**, drawn from 90 candidate neighbors. These are disjoint rings, each with its own learned cell-type composition. The MAP mixture uses five reproducible initializations and retains the highest-objective fit, with diagnostics for every start. Neighborhood scales are independent of clustering resolution:
+
+```python
+settings = ls.regions.GradientSettings(ring_ends=(15, 30, 60), far_k=90)
+```
+
+Sample and optional piece IDs prevent cross-group neighbors even when coordinate frames overlap. Every supplied group must have more than `far_k` cells; small pieces raise an error rather than silently changing scale or dropping cells. Within a pooled fit, all cells have equal weight and share component profiles and mixture weights. To fit sections independently, call the workflow separately for each section. Piece IDs isolate neighborhoods but do not force different region identities in disconnected pieces.
+
+### Compare resolution and reproducibility
+
+Reuse the prepared features to compare component counts and seeds:
+
+```python
+scan = ls.regions.fit_resolutions(
+    features=prepared, n_regions=(8, 12, 16), seeds=(17, 29, 43),
+)
+print(scan.summary)  # seed agreement, convergence, occupied regions, minimum support
+fine = scan.best(n_regions=16)  # best objective among seeds at this chosen resolution
+```
+
+The scan does **not** choose a region count by maximizing training likelihood. Compare spatial maps, region compositions, small-region support, and seed stability. Fits at different resolutions are not a nested hierarchy: increasing the count can move boundaries as well as split components. Adjacent gradient neighborhood scales can be checked by preparing a second set of features explicitly.
+
+### Review and merge overclustered regions
+
+```python
+# Example only: replace these IDs after inspecting your own region maps/profiles.
+reviewed = fine.merge({3: 1, 7: 1})
+reviewed.save("/results/regions_16_reviewed")
+```
+
+This maps fine regions 3 and 7 into region 1; unmapped IDs stay unchanged. Mappings are applied once, not transitively. The original fine label is retained for every cell. Coarse memberships are summed, but hard assignments are mapped directly from the fine labels, so merging cannot move a cell across an existing fine-region boundary. The complete mapping and source-fit fingerprint are exported for review and reproducibility.
+
+### Outputs and interpretation
+
+`result.assignments` retains input row IDs and contains `region`, `membership_max`, `membership_margin`, and `membership_entropy`. Memberships measure the mixture model's relative support, **not calibrated anatomical confidence**. Overlapping neighborhoods reuse cells, and anatomically distinct regions can share compositions. No anatomical annotations are read by the fitting code.
+
+Exports include assignments, memberships, per-ring profiles, region sizes, gradients, optimization histories, the fitted JSON model, and a manifest recording scales, vocabulary, seed, versions, and input/fit fingerprints. Known absent types can be retained by supplying `cell_types=(...)` during preparation; types outside that vocabulary raise an error. Prepared inputs are checked for accidental modification before fitting/exporting.
+
+`ls.ring_model.RingMixture.load(".../model.json")` reloads a model without pickle. Its `predict_proba(prepared.rings)` requires the same vocabulary and ring sizes. Use prediction when deliberately reusing existing profiles; refit to discover new region compositions in a new section. Keep the accompanying manifest to reproduce the spatial preprocessing.
+
+The runnable [CSV analysis example](examples/call_regions.py) exposes section/piece columns, neighborhood scales, and region count on the command line.
+
+## Historical neural workflows
+
+The original [spinal cord](examples/spc_laminae_example.ipynb) and [cortex](examples/v1_example.ipynb) notebooks illustrate the method, but contain machine-specific data paths and historical postprocessing code. Use the package functions for the corrected behavior below; `structure_pred_nearest` is no longer an output. The following runner is a historical neural model, not the recommended gradient-ring mixture.
 
 ## Preparing and fitting data
 

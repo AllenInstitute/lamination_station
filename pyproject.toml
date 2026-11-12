@@ -99,6 +99,7 @@ output = "build/documentation/coverage.xml"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
+pythonpath = ["src"]
 addopts = [
     "-ra", 
     "--verbose",

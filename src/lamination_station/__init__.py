@@ -11,6 +11,8 @@ from lamination_station import post as po
 from lamination_station import integral_model_notmvn
 from lamination_station import composition
 from lamination_station import spatial_graph
+from lamination_station import regions
+from lamination_station import ring_model
 
 __all__ = [
     "model",
@@ -22,6 +24,8 @@ __all__ = [
     "integral_model_notmvn",
     "composition",
     "spatial_graph",
+    "regions",
+    "ring_model",
     "pl",
     "pp",
     "po",
