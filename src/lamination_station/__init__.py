@@ -13,6 +13,8 @@ from lamination_station import composition
 from lamination_station import spatial_graph
 from lamination_station import regions
 from lamination_station import ring_model
+from lamination_station import contacts
+from lamination_station import ordering
 
 __all__ = [
     "model",
@@ -26,6 +28,8 @@ __all__ = [
     "spatial_graph",
     "regions",
     "ring_model",
+    "contacts",
+    "ordering",
     "pl",
     "pp",
     "po",

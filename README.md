@@ -62,7 +62,73 @@ reviewed.save("/results/regions_16_reviewed")
 
 This maps fine regions 3 and 7 into region 1; unmapped IDs stay unchanged. Mappings are applied once, not transitively. The original fine label is retained for every cell. Coarse memberships are summed, but hard assignments are mapped directly from the fine labels, so merging cannot move a cell across an existing fine-region boundary. The complete mapping and source-fit fingerprint are exported for review and reproducibility.
 
-### Outputs and interpretation
+### Number regions using spatial adjacency
+
+After fitting, infer a useful display order directly from physical contacts:
+
+```python
+ordered = result.order_laminae()  # automatic endpoints, no anchors or layer labels
+numbered_cells = result.assignments.join(ordered.annotate(result.assignments.region))
+ordered.save("/scratch/lamination/region_order")  # new directory
+```
+
+**Harmonic ordering is the default and always infers its endpoints.** In each
+connected region graph it selects the most separated pair by effective
+resistance, using contact weights as conductances, and assigns any additional
+terminal branches to their nearer pole. It then computes a harmonic coordinate
+on the full graph. You do not need to recognize branching layers or identify
+superficial/deep regions. Parallel V1/V2 L4/L5 paths and their reconvergence stay
+in the graph; it is never reduced to a spanning tree.
+
+`ordered.regions` contains display numbers, graph coordinates, inferred endpoint
+roles, numerical tie groups, and diagnostics. `ordered.edges` retains all original
+contacts, and `ordered.precedes` records increasing contact paths; parallel arms
+can be incomparable even though display numbers are unique. No anatomical
+homology or physical depth is inferred. Different branch lengths/weights can
+place analogous layers at different coordinates. Endpoint-pair ties and
+ambiguous terminal choices are flagged, but do not block numbering. Isolated
+regions receive display numbers with missing coordinates. Weak peripheral
+regions can attract an inferred endpoint; inspect neighborhood/sample sensitivity.
+
+Direction is a reproducible convention based on region IDs unless you optionally
+provide `reference_order`, a Series indexed by region ID. That reference can
+only flip direction, break coordinate ties, and place disconnected components;
+it does not select endpoints or branches. An existing anatomical order can thus
+keep plots facing the familiar direction without guiding endpoint inference.
+Legacy Fiedler ordering remains available as `method=ls.ordering.OrderMethod.SPECTRAL`.
+No mode requires supervised anchors.
+
+Sample/piece isolation follows feature preparation. Contacts use mutual kNN
+(default 12), capped at 2.5 times the smaller endpoint's median first-six-neighbor
+spacing. Counts are normalized by region incident degrees, including within-region
+contacts, and averaged over available sections within units and over units.
+Use `unit_col="donor"` to balance sections within donors. Pairs require `min_cells=20`
+per region per section. Exact-distance ties can depend on cell row order; known
+piece IDs guarantee separation that a distance cap alone cannot provide for tiny
+fragments. Optional `min_weight` excludes weak edges from ordering while retaining
+them in the exported edge table. Original assignments and probabilities stay intact.
+
+For already computed graphs, use `ls.ordering.order_regions(adjacency=...)`.
+For a target subset of a larger tissue section, use
+`ls.contacts.local_cell_contacts(cells=full_context, ..., target_ids=target.index)`
+and `ls.contacts.aggregate_region_contacts(...)` first. This prevents artificial
+contacts across excluded tissue. These functions expose raw per-section counts,
+normalized graphs, and sample balancing for sensitivity analysis and caching.
+
+Run the [branching example](examples/order_branched_laminae.py) to export a graph
+with parallel V1/V2 paths and a vector figure:
+
+```sh
+python examples/order_branched_laminae.py /scratch/lamination/branch_demo
+```
+
+The underlying methods are spectral seriation
+([Atkins et al., 1998](https://epubs.siam.org/doi/abs/10.1137/S0097539795285771))
+effective-resistance distances ([NetworkX documentation](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.distance_measures.resistance_distance.html)),
+and the graph Dirichlet/harmonic problem
+([Grady, 2006](https://leogrady.net/wp-content/uploads/2017/01/grady2006random.pdf)).
+
+### Cell and model exports
 
 `result.assignments` retains input row IDs and contains `region`, `membership_max`, `membership_margin`, and `membership_entropy`. Memberships measure the mixture model's relative support, **not calibrated anatomical confidence**. Overlapping neighborhoods reuse cells, and anatomically distinct regions can share compositions. No anatomical annotations are read by the fitting code.
 

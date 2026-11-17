@@ -17,6 +17,8 @@ from scipy.special import xlogy
 from sklearn.metrics import adjusted_rand_score
 
 from lamination_station.preprocessing import calculate_comp_grads
+from lamination_station.contacts import aggregate_region_contacts, local_cell_contacts
+from lamination_station.ordering import LaminarOrdering, OrderMethod, order_regions
 from lamination_station.ring_model import (
     FitSettings,
     RingMixture,
@@ -298,6 +300,50 @@ class RegionResult:
     model: RingMixture
     memberships: pd.DataFrame
     assignments: pd.DataFrame
+
+    def order_laminae(
+        self,
+        *,
+        method: OrderMethod = OrderMethod.HARMONIC,
+        reference_order: pd.Series | None = None,
+        unit_col: str | None = None,
+        n_neighbors: int = 12,
+        gap_factor: float = 2.5,
+        min_cells: int = 20,
+        min_weight: float = 0.0,
+    ) -> LaminarOrdering:
+        """Order fitted regions using physical contacts in their prepared cells.
+
+        Sample/piece isolation follows preparation; unit_col optionally balances
+        sections within donors or loads and must be constant within each sample.
+        This leaves assignments and fitted probabilities unchanged. To find
+        contacts in a larger context than the fitted cells, use contacts functions
+        and ordering.order_regions directly. Endpoints are inferred automatically. See that function for
+        the distinction between display numbers and partial order.
+        """
+        _validate_features(self.features)
+        cells = self.features.cells
+        sample_col = self.features.sample_col
+        samples = cells[sample_col] if sample_col is not None else pd.Series(0, index=cells.index)
+        units = None
+        if unit_col is not None:
+            if unit_col not in cells or cells[unit_col].isna().any():
+                raise ValueError("unit_col must identify a nonmissing unit for every cell")
+            grouped = cells[unit_col].groupby(samples, observed=True)
+            if (grouped.nunique() != 1).any():
+                raise ValueError("unit_col must be constant within each sample")
+            units = grouped.first()
+        contacts = local_cell_contacts(
+            cells=cells, x_col=self.features.source_columns[0], y_col=self.features.source_columns[1],
+            sample_col=sample_col, piece_col=self.features.piece_col,
+            neighbors=(n_neighbors,), gap_factor=gap_factor,
+        )[n_neighbors]
+        graph = aggregate_region_contacts(
+            contacts=contacts, labels=self.assignments.region, samples=samples,
+            units=units, region_ids=self.memberships.columns, min_cells=min_cells,
+        )
+        return order_regions(adjacency=graph.adjacency, method=method, reference_order=reference_order,
+                             min_weight=min_weight)
 
     @property
     def fit_fingerprint(self) -> str:

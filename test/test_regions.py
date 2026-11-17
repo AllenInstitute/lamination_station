@@ -157,6 +157,18 @@ def test_merging_preserves_hard_boundaries(
         result.merge({1: -1})
 
 
+def test_fitted_result_ordering_preserves_assignments(prepared: regions.GradientRings) -> None:
+    """The public ordering step annotates calls without changing fitted regions."""
+    result = regions.fit_regions(features=prepared, n_regions=3, n_init=1)
+    before = result.assignments.copy(deep=True)
+    order = result.order_laminae(min_cells=1)
+    assert sorted(order.regions.lamina_number) == [1, 2, 3]
+    annotated = order.annotate(result.assignments.region)
+    assert annotated.index.equals(result.assignments.index)
+    assert annotated.lamina_number.notna().all()
+    pd.testing.assert_frame_equal(before, result.assignments)
+
+
 class _InputColumns(TypedDict):
     """Named preparation columns used in validation cases."""
 
